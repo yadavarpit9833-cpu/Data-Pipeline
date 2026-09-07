@@ -1,0 +1,10 @@
+requests
+pandas
+numpy
+scikit-learn
+apscheduler
+psycopg2-binary
+python-dotenv
+cfgrib
+xarray
+sqlalchemy
