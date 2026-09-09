@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 import logging
 import requests
 import pandas as pd
@@ -8,6 +9,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from db import get_db_connection, execute_query, init_db
 from cleaning import clean_and_impute
+from storage import save_raw_data, save_cleaned_data_parquet
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,6 +18,28 @@ logger = logging.getLogger('fetch_firms')
 load_dotenv()
 
 FIRMS_MAP_KEY = os.getenv('FIRMS_MAP_KEY')
+
+def compute_payload_hash(data):
+    """Computes SHA-256 hash of raw payload for fast, indexed uniqueness checks."""
+    if isinstance(data, str):
+        b = data.encode('utf-8')
+    elif isinstance(data, bytes):
+        b = data
+    else:
+        b = str(data).encode('utf-8')
+    return hashlib.sha256(b).hexdigest()
+
+def format_firms_timestamp(row, fallback_iso):
+    """Formats observation timestamp from FIRMS acq_date and acq_time."""
+    date_str = str(row.get('acq_date', '')).strip()
+    time_str = str(row.get('acq_time', '')).strip().zfill(4)
+    if date_str and len(date_str) == 10 and len(time_str) == 4:
+        try:
+            dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H%M").replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        except Exception:
+            pass
+    return fallback_iso
 
 def fetch_with_retry(url, headers=None, params=None, max_retries=3):
     """Fetch URL with exponential backoff"""
@@ -54,15 +78,19 @@ def main():
         try:
             csv_data = fetch_with_retry(url)
             
-            # 1. Save RAW Data
+            # 1. Save RAW Data (Idempotent with SHA-256 hash)
+            raw_hash = compute_payload_hash(csv_data)
             conn = get_db_connection()
             cursor = conn.cursor()
             execute_query(
                 cursor,
-                "INSERT INTO raw_firms (timestamp, raw_data) VALUES (%s, %s)",
-                (timestamp, csv_data)
+                "INSERT OR IGNORE INTO raw_firms (timestamp, raw_data, raw_data_hash, source, is_synthetic) VALUES (%s, %s, %s, %s, %s)",
+                (timestamp, csv_data, raw_hash, 'firms', 0)
             )
             conn.commit()
+            
+            # Dual-write RAW to data lake
+            save_raw_data('firms', timestamp, csv_data, ext='csv')
             
             # 2. Validate and Parse Data
             if "latitude" not in csv_data.lower() and "country_id" not in csv_data.lower():
@@ -71,7 +99,10 @@ def main():
                 continue
 
             df = pd.read_csv(StringIO(csv_data))
-            df['timestamp'] = timestamp
+            if 'acq_date' in df.columns and 'acq_time' in df.columns:
+                df['timestamp'] = df.apply(lambda r: format_firms_timestamp(r, timestamp), axis=1)
+            else:
+                df['timestamp'] = timestamp
             
             if not df.empty:
                 all_dfs.append(df)
@@ -108,13 +139,16 @@ def main():
     }, inplace=True, errors='ignore')
     
     if 'brightness_raw' in combined_df.columns and 'lat' in combined_df.columns and 'lon' in combined_df.columns:
-        combined_df = clean_and_impute(combined_df, 'brightness_raw', 'timestamp', lat_col='lat', lon_col='lon')
+        combined_df = clean_and_impute(
+            combined_df, 'brightness_raw', 'timestamp', lat_col='lat', lon_col='lon',
+            min_val=200.0, max_val=600.0, max_step_change=150.0
+        )
         
     if 'confidence_raw' in combined_df.columns:
         combined_df['confidence_clean'] = combined_df['confidence_raw']
         combined_df['confidence_imputed'] = 0
         
-    # 3. Save Cleaned Data
+    # 3. Save Cleaned Data (Idempotent)
     conn = None
     cursor = None
     try:
@@ -123,26 +157,50 @@ def main():
         
         for _, row in combined_df.iterrows():
             imputed_val = 1 if row.get('brightness_raw_imputed', False) else 0
+            # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
             execute_query(cursor, """
-                INSERT INTO cleaned_firms (
+                INSERT OR IGNORE INTO cleaned_firms (
                     lat, lon, timestamp,
-                    brightness_raw, brightness_clean, brightness_imputed,
+                    brightness_raw, brightness_clean, brightness_imputed, brightness_qc_flag,
                     confidence_raw, confidence_clean, confidence_imputed,
-                    satellite
+                    satellite,
+                    source, is_synthetic
                 ) VALUES (
                     %s, %s, %s,
+                    %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s,
-                    %s
+                    %s,
+                    %s, %s
                 )
             """, (
                 row.get('lat'), row.get('lon'), row.get('timestamp'),
-                row.get('brightness_raw'), row.get('brightness_raw_clean'), imputed_val,
+                row.get('brightness_raw'), row.get('brightness_raw_clean'), imputed_val, row.get('brightness_raw_qc_flag', 'ok'),
                 str(row.get('confidence_raw')), str(row.get('confidence_clean')), 0,
-                str(row.get('satellite'))
+                str(row.get('satellite')),
+                'firms', 0
             ))
         conn.commit()
-        logger.info(f"Saved {len(combined_df)} cleaned FIRMS records to database.")
+        
+        # Dual-write Cleaned to Parquet
+        date_str = timestamp[:10]
+        
+        # Rename columns to match the canonical SQLite schema
+        if 'brightness_raw_clean' in combined_df.columns:
+            combined_df.rename(columns={
+                'brightness_raw_clean': 'brightness_clean',
+                'brightness_raw_imputed': 'brightness_imputed',
+                'brightness_raw_qc_flag': 'brightness_qc_flag'
+            }, inplace=True)
+            
+        combined_df['source'] = 'firms'
+        combined_df['is_synthetic'] = 0
+            
+        save_cleaned_data_parquet(
+            combined_df, source='firms', partition_key='date', partition_value=date_str,
+            dedup_keys=['lat', 'lon', 'timestamp', 'satellite'], pure_overwrite=False
+        )
+        
+        logger.info(f"Saved {len(combined_df)} cleaned FIRMS records to database and Parquet.")
     except Exception as e:
         logger.error(f"Database error during cleaned FIRMS save: {e}")
         return ('failure', 0, str(e))
@@ -165,4 +223,8 @@ def main():
     return (status, len(combined_df), err)
 
 if __name__ == "__main__":
-    main()
+    from datetime import datetime, timezone
+    from run_logger import log_run
+    _started = datetime.now(timezone.utc).isoformat()
+    _result = main()
+    log_run('firms', _started, _result)

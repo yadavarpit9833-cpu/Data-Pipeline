@@ -28,11 +28,21 @@ def get_db_connection():
 
 def execute_query(cursor, query, params=()):
     """
-    Executes query handling placeholder translation between SQLite (?) and Postgres (%s).
+    Executes query handling placeholder translation between SQLite (?) and Postgres (%s),
+    as well as conflict handling (INSERT OR IGNORE vs ON CONFLICT DO NOTHING).
     """
-    if DB_ENGINE != 'postgres':
+    if DB_ENGINE == 'postgres':
+        if 'INSERT OR IGNORE INTO' in query:
+            query = query.replace('INSERT OR IGNORE INTO', 'INSERT INTO')
+            if 'ON CONFLICT' not in query:
+                query = query + ' ON CONFLICT DO NOTHING'
+    else:
         query = query.replace('%s', '?')
+        if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
+            query = query.replace('INSERT INTO', 'INSERT OR IGNORE INTO').replace(' ON CONFLICT DO NOTHING', '')
+            
     cursor.execute(query, params)
+
 
 def init_db(schema_file='schema.sql'):
     """Applies schema.sql to the database."""

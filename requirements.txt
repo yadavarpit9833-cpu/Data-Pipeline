@@ -8,3 +8,6 @@ python-dotenv
 cfgrib
 xarray
 sqlalchemy
+pandera
+duckdb
+pyarrow

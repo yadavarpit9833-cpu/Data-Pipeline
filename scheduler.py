@@ -8,9 +8,11 @@ from db import get_db_connection, execute_query, init_db
 
 # Import main functions from fetchers
 from fetch_cpcb import main as fetch_cpcb
-from fetch_imd import main as fetch_imd
+from fetch_weather import main as fetch_weather
 from fetch_gfs import main as fetch_gfs
 from fetch_firms import main as fetch_firms
+from fetch_sentinel5p import main as fetch_sentinel5p
+from gold_layer import build_all_gold
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -105,8 +107,8 @@ if __name__ == '__main__':
         run_job,
         'interval',
         minutes=60,
-        args=['imd', 'IMD Weather', fetch_imd],
-        id='imd_job',
+        args=['weather', 'Open-Meteo Weather', fetch_weather],
+        id='weather_job',
         next_run_time=now_utc
     )
 
@@ -126,6 +128,28 @@ if __name__ == '__main__':
         CronTrigger(hour='0,6,12,18', minute=30, timezone='UTC'),
         args=['gfs', 'GFS Grid Weather', fetch_gfs],
         id='gfs_job',
+        next_run_time=now_utc
+    )
+
+    # Sentinel-5P TROPOMI: once daily at 12:00 UTC (CAMS daily composite available by then)
+    scheduler.add_job(
+        run_job,
+        CronTrigger(hour=12, minute=0, timezone='UTC'),
+        args=['sentinel5p', 'Sentinel-5P TROPOMI Satellite', fetch_sentinel5p],
+        id='sentinel5p_job',
+        next_run_time=now_utc
+    )
+
+    # Gold layer: rebuild every 60 min so analysis-ready features stay fresh
+    def _gold_job():
+        n = build_all_gold()
+        return ('success', n, None)
+    scheduler.add_job(
+        run_job,
+        'interval',
+        minutes=60,
+        args=['gold', 'Medallion Gold Layer', _gold_job],
+        id='gold_job',
         next_run_time=now_utc
     )
 

@@ -11,7 +11,7 @@ DB_PATH = 'env_data.db'
 SOURCES = {
     'cpcb':  {'name': 'CPCB Air Quality', 'interval': 15,  'threshold': 30},
     'firms': {'name': 'FIRMS Active Fires', 'interval': 20,  'threshold': 40},
-    'imd':   {'name': 'IMD Weather',      'interval': 60,  'threshold': 120},
+    'weather': {'name': 'Open-Meteo Weather', 'interval': 60,  'threshold': 120},
     'gfs':   {'name': 'GFS Grid Forecast', 'interval': 360, 'threshold': 720},
 }
 

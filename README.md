@@ -1,26 +1,26 @@
 # Real-Time Environmental Data Pipeline
 
-This repository contains a production-grade real-time environmental data pipeline for India. It fetches data from CPCB (Air Quality), IMD (Weather), NOAA GFS (Forecasts), and NASA FIRMS (Active Fire), cleans the data, and stores it in a PostgreSQL database.
+This repository contains a production-grade real-time environmental data pipeline for India. It fetches data from CPCB (Air Quality), Open-Meteo (Weather, fallback for IMD), NOAA GFS (Forecasts), and NASA FIRMS (Active Fire), cleans the data, and stores it in a PostgreSQL database.
 
 ## Architecture
 
 The pipeline consists of four separate fetcher modules orchestrated by a central scheduler:
 1. `fetch_cpcb.py`: Fetches Air Quality data from CPCB (fallback WAQI). (Runs every 15 min)
-2. `fetch_imd.py`: Fetches real-time weather from IMD API endpoints. (Runs every 60 min)
+2. `fetch_weather.py`: Fetches real-time weather using Open-Meteo API as a fallback (the original IMD API requires IP whitelisting). (Runs every 60 min)
 3. `fetch_gfs.py`: Downloads GFS GRIB2 data from NOAA NOMADS. (Runs every 6 hours)
 4. `fetch_firms.py`: Fetches active fire events from NASA FIRMS. (Runs every 20 min)
 
-`cleaning.py` acts as a shared module for outlier detection (3 standard deviations) and imputation (time-based interpolation + spatial KNN). The original raw responses are saved into `raw_*` tables, and cleaned values are stored in `cleaned_*` tables, maintaining the audit trail of exact values received.
+`cleaning.py` acts as a shared Quality Control (QC) module. The pipeline preserves original raw responses in `raw_*` tables and stores cleaned values with explicit quality flags in `cleaned_*` tables, maintaining full auditability without discarding real readings or pollution spikes.
 
 ## Setup Instructions
 
 ### 1. Database Setup
 
-Ensure you have a PostgreSQL database running.
+Ensure you have SQLite or PostgreSQL running.
 
 ```bash
-# Create the database tables
-psql -U postgres -d env_data -a -f schema.sql
+# Initialize database schema
+python db.py
 ```
 
 ### 2. Environment Variables
@@ -35,7 +35,7 @@ You will need two API keys:
 1. **WAQI Token**: Serves as a fallback for CPCB data. Get yours from [WAQI Data Platform](https://aqicn.org/data-platform/token/).
 2. **FIRMS MAP_KEY**: Required for fetching NASA active fire data. Get yours from [NASA FIRMS API](https://firms.modaps.eosdis.nasa.gov/api/).
 
-GFS and IMD do not require API keys.
+GFS and Open-Meteo do not require API keys.
 
 ### 3. Install Python Dependencies
 
@@ -59,9 +59,16 @@ To run the continuous pipeline orchestration:
 python scheduler.py
 ```
 
-## Data Cleaning & Imputation Rules
+## Data Quality Control & Imputation Rules
 
-- **Outlier Detection**: Values beyond 3 standard deviations are flagged and set to `NaN` for imputation.
-- **Time-based Imputation**: Missing values (including outliers) are interpolated over time if the gap is less than 3 consecutive readings.
-- **Spatial Imputation**: Longer gaps fall back to spatial KNN imputation from nearby stations based on latitude/longitude (if applicable).
-- **Imputation Tracking**: Imputed values are never written over original raw data. Clean tables store `*_raw`, `*_clean`, and a boolean `*_imputed` flag.
+- **Preservation of Real Pollution Spikes**: Flagged readings are **never deleted or set to NaN**. Raw values are preserved in full so downstream models can analyze genuine pollution events.
+- **Multi-Stage QC Chain**:
+  1. **Range Check (`range_fail`)**: Flags physically impossible readings based on metric limits (e.g., PM2.5 outside 0–1000 µg/m³).
+  2. **Step Check (`step_fail`)**: Flags implausibly rapid jumps compared to prior readings at the same station. Uses circular difference arithmetic for wind direction (`wind_dir`).
+  3. **Flatline Check (`flatline`)**: Flags values that repeat identically for 12+ consecutive hours (stuck sensors). Ignores consecutive zeros for rainfall/precipitation (`ignore_zero_flatline=True`), as dry spells are genuine weather.
+  4. **Log-Space MAD Check (`mad_outlier`)**: Optional skew-robust statistical outlier detection operating in log-space ($\log(x + 1)$) using Median Absolute Deviation.
+- **QC Flag Formatting**: Multi-failure results are stored as comma-separated strings (e.g. `"range_fail,step_fail"` or `"ok"`).
+- **NaN-Only Imputation**: Interpolation (temporal & spatial KNN) applies **only** to originally missing (`NaN`) values.
+- **GFS Forecast Timestamps**: GFS records store explicit `valid_time` (the physical forecast-valid timestamp computed from cycle start + `fhr` offset) separately from `fetched_at` (download audit timestamp), enabling exact temporal deduplication and real-world time matching.
+
+
