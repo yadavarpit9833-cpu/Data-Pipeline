@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from db import get_db_connection, execute_query, init_db
 from cleaning import clean_and_impute
 from storage import save_raw_data, save_cleaned_data_parquet
+from contracts import validate
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -184,7 +185,7 @@ def main():
     except Exception as e:
         logger.error(
             f"NOAA NOMADS fetch failed: {e}. "
-            "Falling back to HARDCODED CONSTANT GRID (temperature=25.0°C, wind=1.0m/s, precip=0.0mm). "
+            "Falling back to HARDCODED CONSTANT GRID (temperature=25.0 deg C, wind=1.0m/s, precip=0.0mm). "
             "These are NOT real measurements. Rows will be tagged is_synthetic=True/source='fallback_constant'."
         )
         err_note = f"NOAA fetch failed ({e}); used hardcoded constant fallback (NOT Open-Meteo)"
@@ -256,6 +257,28 @@ def main():
                 ignore_zero_flatline=opts['ignore_zero_flatline']
             )
             
+    # Rename columns to match the canonical SQLite schema
+    rename_map = {}
+    for metric in qc_params.keys():
+        base = metric.replace('_raw', '')
+        rename_map[f"{metric}_clean"] = f"{base}_clean"
+        rename_map[f"{metric}_imputed"] = f"{base}_imputed"
+        rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
+    df.rename(columns=rename_map, inplace=True)
+    
+    if 'is_synthetic' not in df.columns:
+        df['is_synthetic'] = False
+        
+    df['source'] = df['is_synthetic'].apply(lambda x: 'fallback_constant' if x else 'noaa')
+    df['is_synthetic'] = df['is_synthetic'].apply(lambda x: 1 if x else 0)
+    
+    # Contract validation ? partial success supported
+    df, failures = validate(df, 'gfs')
+    
+    if df.empty and not failures.empty:
+        logger.error("All GFS data failed contract validation.")
+        return ('failure', 0, f"All rows failed contract validation. {len(failures)} failures.")
+            
     # 3. Batch Insert into cleaned_gfs (Idempotent)
     conn = get_db_connection()
     cur = conn.cursor()
@@ -269,23 +292,23 @@ def main():
             str(row['valid_time']),
             str(row['fetched_at']),
             row.get('temperature_raw'),
-            row.get('temperature_raw_clean'),
-            1 if row.get('temperature_raw_imputed') else 0,
-            row.get('temperature_raw_qc_flag', 'ok'),
+            row.get('temperature_clean'),
+            1 if row.get('temperature_imputed') else 0,
+            row.get('temperature_qc_flag', 'ok'),
             row.get('precipitation_raw'),
-            row.get('precipitation_raw_clean'),
-            1 if row.get('precipitation_raw_imputed') else 0,
-            row.get('precipitation_raw_qc_flag', 'ok'),
+            row.get('precipitation_clean'),
+            1 if row.get('precipitation_imputed') else 0,
+            row.get('precipitation_qc_flag', 'ok'),
             row.get('u_wind_raw'),
-            row.get('u_wind_raw_clean'),
-            1 if row.get('u_wind_raw_imputed') else 0,
-            row.get('u_wind_raw_qc_flag', 'ok'),
+            row.get('u_wind_clean'),
+            1 if row.get('u_wind_imputed') else 0,
+            row.get('u_wind_qc_flag', 'ok'),
             row.get('v_wind_raw'),
-            row.get('v_wind_raw_clean'),
-            1 if row.get('v_wind_raw_imputed') else 0,
-            row.get('v_wind_raw_qc_flag', 'ok'),
-            'fallback_constant' if row.get('is_synthetic') else 'noaa',
-            1 if row.get('is_synthetic') else 0
+            row.get('v_wind_clean'),
+            1 if row.get('v_wind_imputed') else 0,
+            row.get('v_wind_qc_flag', 'ok'),
+            row.get('source'),
+            row.get('is_synthetic')
         ))
         
     cur.executemany("""
@@ -314,17 +337,6 @@ def main():
     conn.close()
     
     # Dual-write Cleaned to Parquet (pure overwrite for GFS cycles)
-    # Rename columns to match the canonical SQLite schema
-    rename_map = {}
-    for metric in qc_params.keys():
-        base = metric.replace('_raw', '')
-        rename_map[f"{metric}_clean"] = f"{base}_clean"
-        rename_map[f"{metric}_imputed"] = f"{base}_imputed"
-        rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
-    df.rename(columns=rename_map, inplace=True)
-    df['source'] = df['is_synthetic'].apply(lambda x: 'fallback_constant' if x else 'noaa')
-    df['is_synthetic'] = df['is_synthetic'].apply(lambda x: 1 if x else 0)
-    
     save_cleaned_data_parquet(
         df, source='gfs', partition_key='cycle', partition_value=grid_rows[0]['cycle'],
         dedup_keys=['lat', 'lon', 'valid_time'], pure_overwrite=True
@@ -332,15 +344,23 @@ def main():
     logger.info("Saved cleaned GFS records to Parquet.")
 
     expected_pts = 14625
+    status = 'success'
+    err = None
+    
     if len(grid_rows) >= expected_pts and not err_note:
         status = 'success'
-        err = None
     elif len(grid_rows) > 0:
         status = 'partial'
         err = f"Fetched {len(grid_rows)} of {expected_pts} points. {err_note or ''}".strip()
     else:
         status = 'failure'
         err = "Zero grid points fetched"
+        
+    if not failures.empty:
+        status = 'partial'
+        bad_indices = len(failures['index'].dropna().unique())
+        msg = f"{bad_indices} bad rows dropped due to contract violations."
+        err = f"{err} | {msg}" if err else msg
 
     return (status, len(cleaned_insert_rows), err)
 

@@ -15,7 +15,16 @@ from fetch_sentinel5p import main as fetch_sentinel5p
 from gold_layer import build_all_gold
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path, encoding='utf-8-sig'),
+        logging.StreamHandler()
+    ],
+    force=True
+)
 logger = logging.getLogger('scheduler')
 
 # Global set to track active running jobs (prevents overlapping execution for long-running jobs)

@@ -184,7 +184,30 @@ def main():
     df_clean = full_df[full_df['_is_new']].copy()
     df_clean.drop(columns=['_is_new'], inplace=True)
         
-    # 3. Save Cleaned Data
+    # Rename columns to match the canonical SQLite schema before validation
+    rename_map = {}
+    for metric in qc_params.keys():
+        base = metric.replace('_raw', '')
+        rename_map[f"{metric}_clean"] = f"{base}_clean"
+        rename_map[f"{metric}_imputed"] = f"{base}_imputed"
+        rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
+        
+    cols_to_drop = [col for col in rename_map.values() if col in df_clean.columns]
+    if cols_to_drop:
+        df_clean.drop(columns=cols_to_drop, inplace=True)
+        
+    df_clean.rename(columns=rename_map, inplace=True)
+    df_clean['source'] = 'cpcb'
+    df_clean['is_synthetic'] = 0
+    
+    # Contract validation ? partial success supported
+    df_clean, failures = validate(df_clean, 'cpcb')
+    
+    if df_clean.empty and not failures.empty:
+        logger.error("All CPCB data failed contract validation.")
+        return ('failure', 0, f"All rows failed contract validation. {len(failures)} failures.")
+        
+    # 3. Save Cleaned Data to SQLite
     conn = None
     cursor = None
     try:
@@ -192,7 +215,6 @@ def main():
         cursor = conn.cursor()
         
         for _, row in df_clean.iterrows():
-            # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
             execute_query(cursor, """
                 INSERT OR IGNORE INTO cleaned_cpcb (
                     station_id, city, timestamp,
@@ -215,48 +237,22 @@ def main():
                 )
             """, (
                 row['station_id'], row['city'], row['timestamp'],
-                row.get('pm25_raw'), row.get('pm25_raw_clean'), 1 if row.get('pm25_raw_imputed') else 0, row.get('pm25_raw_qc_flag', 'ok'),
-                row.get('pm10_raw'), row.get('pm10_raw_clean'), 1 if row.get('pm10_raw_imputed') else 0, row.get('pm10_raw_qc_flag', 'ok'),
-                row.get('no2_raw'),  row.get('no2_raw_clean'),  1 if row.get('no2_raw_imputed') else 0,  row.get('no2_raw_qc_flag', 'ok'),
-                row.get('so2_raw'),  row.get('so2_raw_clean'),  1 if row.get('so2_raw_imputed') else 0,  row.get('so2_raw_qc_flag', 'ok'),
-                row.get('co_raw'),   row.get('co_raw_clean'),   1 if row.get('co_raw_imputed') else 0,   row.get('co_raw_qc_flag', 'ok'),
-                row.get('o3_raw'),   row.get('o3_raw_clean'),   1 if row.get('o3_raw_imputed') else 0,   row.get('o3_raw_qc_flag', 'ok'),
+                row.get('pm25_raw'), row.get('pm25_clean'), 1 if row.get('pm25_imputed') else 0, row.get('pm25_qc_flag', 'ok'),
+                row.get('pm10_raw'), row.get('pm10_clean'), 1 if row.get('pm10_imputed') else 0, row.get('pm10_qc_flag', 'ok'),
+                row.get('no2_raw'),  row.get('no2_clean'),  1 if row.get('no2_imputed') else 0,  row.get('no2_qc_flag', 'ok'),
+                row.get('so2_raw'),  row.get('so2_clean'),  1 if row.get('so2_imputed') else 0,  row.get('so2_qc_flag', 'ok'),
+                row.get('co_raw'),   row.get('co_clean'),   1 if row.get('co_imputed') else 0,   row.get('co_qc_flag', 'ok'),
+                row.get('o3_raw'),   row.get('o3_clean'),   1 if row.get('o3_imputed') else 0,   row.get('o3_qc_flag', 'ok'),
                 'cpcb', 0
             ))
         conn.commit()
         
         # Dual-write Cleaned to Parquet
         date_str = fetch_time[:10]
-        
-        # Rename columns to match the canonical SQLite schema
-        rename_map = {}
-        for metric in qc_params.keys():
-            base = metric.replace('_raw', '')
-            rename_map[f"{metric}_clean"] = f"{base}_clean"
-            rename_map[f"{metric}_imputed"] = f"{base}_imputed"
-            rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
-            
-        # Drop existing target columns if they exist (inherited from ctx_df)
-        cols_to_drop = [col for col in rename_map.values() if col in df_clean.columns]
-        if cols_to_drop:
-            df_clean.drop(columns=cols_to_drop, inplace=True)
-            
-        df_clean.rename(columns=rename_map, inplace=True)
-        df_clean['source'] = 'cpcb'
-        df_clean['is_synthetic'] = 0
-        
-        # Contract validation — fail loudly AFTER columns are populated
-        try:
-            df_clean = validate(df_clean, 'cpcb')
-        except ContractViolationError as cve:
-            logger.error(f"CPCB data contract violated: {cve}")
-            return ('failure', 0, str(cve))
-        
         save_cleaned_data_parquet(
             df_clean, source='cpcb', partition_key='date', partition_value=date_str,
             dedup_keys=['station_id', 'timestamp'], pure_overwrite=False
         )
-        
         logger.info(f"Saved {len(df_clean)} cleaned CPCB/WAQI records to database and Parquet.")
     except Exception as e:
         logger.error(f"Database error during cleaned CPCB save: {e}")
@@ -269,15 +265,18 @@ def main():
             try: conn.close()
             except Exception: pass
 
-
-
-    # Status determination: 5 cities total
-    if len(raw_data_list) == len(cities):
-        status = 'success'
-        err = None
-    else:
+    # Status determination
+    status = 'success'
+    err = None
+    if len(raw_data_list) != len(cities):
         status = 'partial'
         err = f"Fetched {len(raw_data_list)} of {len(cities)} cities. Missing: {', '.join(errors)}"
+    
+    if not failures.empty:
+        status = 'partial'
+        bad_indices = len(failures['index'].dropna().unique())
+        msg = f"{bad_indices} bad rows dropped due to contract violations."
+        err = f"{err} | {msg}" if err else msg
         
     return (status, len(df_clean), err)
 

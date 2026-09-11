@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from db import get_db_connection, execute_query, init_db
 from cleaning import clean_and_impute
 from storage import save_raw_data, save_cleaned_data_parquet
+from contracts import validate
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -148,6 +149,24 @@ def main():
         combined_df['confidence_clean'] = combined_df['confidence_raw']
         combined_df['confidence_imputed'] = 0
         
+    # Rename columns to match the canonical SQLite schema
+    if 'brightness_raw_clean' in combined_df.columns:
+        combined_df.rename(columns={
+            'brightness_raw_clean': 'brightness_clean',
+            'brightness_raw_imputed': 'brightness_imputed',
+            'brightness_raw_qc_flag': 'brightness_qc_flag'
+        }, inplace=True)
+        
+    combined_df['source'] = 'firms'
+    combined_df['is_synthetic'] = 0
+    
+    # Contract validation ? partial success supported
+    combined_df, failures = validate(combined_df, 'firms')
+    
+    if combined_df.empty and not failures.empty:
+        logger.error("All FIRMS data failed contract validation.")
+        return ('failure', 0, f"All rows failed contract validation. {len(failures)} failures.")
+        
     # 3. Save Cleaned Data (Idempotent)
     conn = None
     cursor = None
@@ -156,8 +175,7 @@ def main():
         cursor = conn.cursor()
         
         for _, row in combined_df.iterrows():
-            imputed_val = 1 if row.get('brightness_raw_imputed', False) else 0
-            # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
+            imputed_val = 1 if row.get('brightness_imputed', False) else 0
             execute_query(cursor, """
                 INSERT OR IGNORE INTO cleaned_firms (
                     lat, lon, timestamp,
@@ -174,7 +192,7 @@ def main():
                 )
             """, (
                 row.get('lat'), row.get('lon'), row.get('timestamp'),
-                row.get('brightness_raw'), row.get('brightness_raw_clean'), imputed_val, row.get('brightness_raw_qc_flag', 'ok'),
+                row.get('brightness_raw'), row.get('brightness_clean'), imputed_val, row.get('brightness_qc_flag', 'ok'),
                 str(row.get('confidence_raw')), str(row.get('confidence_clean')), 0,
                 str(row.get('satellite')),
                 'firms', 0
@@ -184,17 +202,6 @@ def main():
         # Dual-write Cleaned to Parquet
         date_str = timestamp[:10]
         
-        # Rename columns to match the canonical SQLite schema
-        if 'brightness_raw_clean' in combined_df.columns:
-            combined_df.rename(columns={
-                'brightness_raw_clean': 'brightness_clean',
-                'brightness_raw_imputed': 'brightness_imputed',
-                'brightness_raw_qc_flag': 'brightness_qc_flag'
-            }, inplace=True)
-            
-        combined_df['source'] = 'firms'
-        combined_df['is_synthetic'] = 0
-            
         save_cleaned_data_parquet(
             combined_df, source='firms', partition_key='date', partition_value=date_str,
             dedup_keys=['lat', 'lon', 'timestamp', 'satellite'], pure_overwrite=False
@@ -213,12 +220,17 @@ def main():
             except Exception: pass
 
     # Status evaluation
-    if len(all_dfs) == len(sensors):
-        status = 'success'
-        err = None
-    else:
+    status = 'success'
+    err = None
+    if len(all_dfs) != len(sensors):
         status = 'partial'
         err = f"Fetched {len(all_dfs)} of {len(sensors)} sensors. Missing: {', '.join(sensor_errors)}"
+        
+    if not failures.empty:
+        status = 'partial'
+        bad_indices = len(failures['index'].dropna().unique())
+        msg = f"{bad_indices} bad rows dropped due to contract violations."
+        err = f"{err} | {msg}" if err else msg
 
     return (status, len(combined_df), err)
 

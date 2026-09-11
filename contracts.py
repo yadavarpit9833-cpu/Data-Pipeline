@@ -104,44 +104,50 @@ _SCHEMAS = {
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def validate(df: pd.DataFrame, source: str) -> pd.DataFrame:
+def validate(df: pd.DataFrame, source: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Validates a DataFrame against the declared schema for the given source.
-    On failure: logs all violations, raises ContractViolationError so the
-    ingestion pipeline can decide to reject or quarantine the batch.
-    Returns the (possibly coerced) DataFrame on success.
-
-    Skips validation gracefully if pandera is not installed.
+    Returns (valid_df, failures_df). If failures exist, bad rows are dropped
+    from valid_df and logged.
     """
     if not HAS_PANDERA:
-        return df
+        return df, pd.DataFrame()
 
     schema_builder = _SCHEMAS.get(source)
     if schema_builder is None:
         logger.warning(f"[contracts] No schema defined for source='{source}'. Skipping validation.")
-        return df
+        return df, pd.DataFrame()
 
     schema = schema_builder()
     try:
         validated = schema.validate(df, lazy=True)
         logger.info(f"[contracts] {source}: {len(df)} rows passed all contract checks.")
-        return validated
+        return validated, pd.DataFrame()
     except pa.errors.SchemaErrors as exc:
         failures = exc.failure_cases
         n_fail = len(failures)
+        
+        # Drop bad rows using the index provided by Pandera
+        bad_indices = failures['index'].dropna().unique()
+        valid_df = df.drop(index=bad_indices)
+        
+        # Save failures to CSV so we never lose them when terminal closes
+        failure_log_path = f"contract_failures_{source}.csv"
+        failures.to_csv(failure_log_path, index=False)
+        
         logger.error(
             f"[contracts] CONTRACT VIOLATION — source='{source}': "
-            f"{n_fail} check failure(s) detected.\n{failures.to_string()}"
+            f"{n_fail} check failure(s) detected. Dropped {len(bad_indices)} bad rows. Saved to {failure_log_path}"
         )
-        raise ContractViolationError(source, failures) from exc
+        return valid_df, failures
 
 
 class ContractViolationError(Exception):
     """Raised when incoming data violates a declared data contract."""
-    def __init__(self, source: str, failures: pd.DataFrame):
+    def __init__(self, source: str, failures: pd.DataFrame, log_path: str):
         self.source = source
         self.failures = failures
         super().__init__(
             f"Data contract violation for source='{source}': "
-            f"{len(failures)} check failure(s). Inspect .failures for details."
+            f"{len(failures)} check failure(s). Inspect '{log_path}' for details."
         )

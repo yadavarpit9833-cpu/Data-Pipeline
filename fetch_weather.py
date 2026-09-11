@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from db import get_db_connection, execute_query, init_db
 from cleaning import clean_and_impute
 from storage import save_raw_data, save_cleaned_data_parquet, load_historical_context
+from contracts import validate
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -123,7 +124,7 @@ def main():
             data = fetch_open_meteo(station_id, name, lat, lon)
             if data:
                 raw_data_list.append(data)
-                logger.info(f"Fetched weather for {name}: temp={data['temperature_raw']}°C, "
+                logger.info(f"Fetched weather for {name}: temp={data['temperature_raw']} deg C, "
                             f"rh={data['humidity_raw']}%, ws={data['wind_speed_raw']}m/s")
             else:
                 errors.append(name)
@@ -200,6 +201,29 @@ def main():
     df_clean = full_df[full_df['_is_new']].copy()
     df_clean.drop(columns=['_is_new'], inplace=True)
         
+    # Rename columns to match the canonical SQLite schema
+    rename_map = {}
+    for metric in qc_params.keys():
+        base = metric.replace('_raw', '')
+        rename_map[f"{metric}_clean"] = f"{base}_clean"
+        rename_map[f"{metric}_imputed"] = f"{base}_imputed"
+        rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
+        
+    cols_to_drop = [col for col in rename_map.values() if col in df_clean.columns]
+    if cols_to_drop:
+        df_clean.drop(columns=cols_to_drop, inplace=True)
+        
+    df_clean.rename(columns=rename_map, inplace=True)
+    df_clean['source'] = 'open-meteo'
+    df_clean['is_synthetic'] = 0
+    
+    # Contract validation ? partial success supported
+    df_clean, failures = validate(df_clean, 'weather')
+    
+    if df_clean.empty and not failures.empty:
+        logger.error("All weather data failed contract validation.")
+        return ('failure', 0, f"All rows failed contract validation. {len(failures)} failures.")
+        
     # 3. Save Cleaned Data
     conn = None
     cursor = None
@@ -207,7 +231,6 @@ def main():
         conn = get_db_connection()
         cursor = conn.cursor()
         for _, row in df_clean.iterrows():
-            # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
             execute_query(cursor, """
                 INSERT OR IGNORE INTO cleaned_imd (
                     station, timestamp,
@@ -228,34 +251,17 @@ def main():
                 )
             """, (
                 row['station'], row['timestamp'],
-                row.get('temperature_raw'), row.get('temperature_raw_clean'), 1 if row.get('temperature_raw_imputed') else 0, row.get('temperature_raw_qc_flag', 'ok'),
-                row.get('humidity_raw'),    row.get('humidity_raw_clean'),    1 if row.get('humidity_raw_imputed') else 0,    row.get('humidity_raw_qc_flag', 'ok'),
-                row.get('rainfall_raw'),    row.get('rainfall_raw_clean'),    1 if row.get('rainfall_raw_imputed') else 0,    row.get('rainfall_raw_qc_flag', 'ok'),
-                row.get('wind_speed_raw'),  row.get('wind_speed_raw_clean'),  1 if row.get('wind_speed_raw_imputed') else 0,  row.get('wind_speed_raw_qc_flag', 'ok'),
-                row.get('wind_dir_raw'),    row.get('wind_dir_raw_clean'),    1 if row.get('wind_dir_raw_imputed') else 0,    row.get('wind_dir_raw_qc_flag', 'ok'),
+                row.get('temperature_raw'), row.get('temperature_clean'), 1 if row.get('temperature_imputed') else 0, row.get('temperature_qc_flag', 'ok'),
+                row.get('humidity_raw'),    row.get('humidity_clean'),    1 if row.get('humidity_imputed') else 0,    row.get('humidity_qc_flag', 'ok'),
+                row.get('rainfall_raw'),    row.get('rainfall_clean'),    1 if row.get('rainfall_imputed') else 0,    row.get('rainfall_qc_flag', 'ok'),
+                row.get('wind_speed_raw'),  row.get('wind_speed_clean'),  1 if row.get('wind_speed_imputed') else 0,  row.get('wind_speed_qc_flag', 'ok'),
+                row.get('wind_dir_raw'),    row.get('wind_dir_clean'),    1 if row.get('wind_dir_imputed') else 0,    row.get('wind_dir_qc_flag', 'ok'),
                 'open-meteo', 0
             ))
         conn.commit()
         
         # Dual-write Cleaned to Parquet
         date_str = fetch_time[:10]
-        
-        # Rename columns to match the canonical SQLite schema
-        rename_map = {}
-        for metric in qc_params.keys():
-            base = metric.replace('_raw', '')
-            rename_map[f"{metric}_clean"] = f"{base}_clean"
-            rename_map[f"{metric}_imputed"] = f"{base}_imputed"
-            rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
-            
-        # Drop existing target columns if they exist (inherited from ctx_df)
-        cols_to_drop = [col for col in rename_map.values() if col in df_clean.columns]
-        if cols_to_drop:
-            df_clean.drop(columns=cols_to_drop, inplace=True)
-            
-        df_clean.rename(columns=rename_map, inplace=True)
-        df_clean['source'] = 'open-meteo'
-        df_clean['is_synthetic'] = 0
         
         save_cleaned_data_parquet(
             df_clean, source='weather', partition_key='date', partition_value=date_str,
@@ -274,16 +280,20 @@ def main():
             try: conn.close()
             except Exception: pass
 
-
-
     # Status determination
     total_expected = len(INDIA_STATIONS)
-    if len(raw_data_list) == total_expected:
-        status = 'success'
-        err = None
-    else:
+    status = 'success'
+    err = None
+    
+    if len(raw_data_list) != total_expected:
         status = 'partial'
         err = f"Fetched {len(raw_data_list)} of {total_expected} stations. Missing: {', '.join(errors)}"
+        
+    if not failures.empty:
+        status = 'partial'
+        bad_indices = len(failures['index'].dropna().unique())
+        msg = f"{bad_indices} bad rows dropped due to contract violations."
+        err = f"{err} | {msg}" if err else msg
         
     return (status, len(df_clean), err)
 

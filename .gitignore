@@ -4,3 +4,6 @@ __pycache__/
 *.db
 raw/
 data/
+
+*.log
+*.csv
