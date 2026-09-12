@@ -13,7 +13,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -826,3 +826,173 @@ class TestDependencyPins(unittest.TestCase):
                 pin_major, got_major,
                 f"{name} is pinned ~={pin} but {installed} is installed: a fresh "
                 f"install would not reproduce what was tested")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FIRMS historical backfill (scripts/backfill_firms_archive.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFIRMSProcessingStream(unittest.TestCase):
+    """
+    FIRMS names its API sources <FAMILY>_<STREAM>: MODIS_NRT is near real time,
+    MODIS_SP is the reprocessed archive of the SAME detections. Storing the
+    whole source string in `sensor` would make one physical fire two rows once
+    the archive backfill covers a window the live fetcher already saw, silently
+    doubling the fire counts any model trains on.
+    """
+
+    def test_source_splits_into_family_and_stream(self):
+        from fetch_firms import split_source
+        self.assertEqual(split_source('MODIS_SP'), ('MODIS', 'SP'))
+        self.assertEqual(split_source('MODIS_NRT'), ('MODIS', 'NRT'))
+        self.assertEqual(split_source('VIIRS_SNPP_SP'), ('VIIRS_SNPP', 'SP'))
+        self.assertEqual(split_source('VIIRS_NOAA20_NRT'), ('VIIRS_NOAA20', 'NRT'))
+
+    def test_unknown_suffix_defaults_to_nrt(self):
+        from fetch_firms import split_source
+        self.assertEqual(split_source('LANDSAT_NRT'), ('LANDSAT', 'NRT'))
+        self.assertEqual(split_source('SOMETHING_ELSE'), ('SOMETHING_ELSE', 'NRT'))
+
+    def test_standardise_frame_records_both_columns(self):
+        from fetch_firms import standardise_frame
+        frame = pd.DataFrame({
+            'latitude': [29.0], 'longitude': [75.0], 'brightness': [320.0],
+            'confidence': [85], 'satellite': ['Terra'], 'frp': [10.0],
+        })
+        out = standardise_frame(frame, 'MODIS_SP')
+        self.assertEqual(out['sensor'].iloc[0], 'MODIS')
+        self.assertEqual(out['processing'].iloc[0], 'SP')
+
+    def test_satellite_fallback_does_not_leak_the_stream(self):
+        """
+        satellite feeds the uniqueness constraint. If it fell back to the raw
+        source name, the same detection would key differently under NRT and SP.
+        """
+        from fetch_firms import standardise_frame
+        base = {'latitude': [29.0], 'longitude': [75.0], 'brightness': [320.0]}
+        nrt = standardise_frame(pd.DataFrame(base), 'MODIS_NRT')['satellite'].iloc[0]
+        sp = standardise_frame(pd.DataFrame(base), 'MODIS_SP')['satellite'].iloc[0]
+        self.assertEqual(nrt, sp)
+        self.assertNotIn('_SP', str(sp))
+        self.assertNotIn('_NRT', str(nrt))
+
+
+class TestFIRMSBackfillPlanning(unittest.TestCase):
+    """The plan decides the API bill before a single request is made."""
+
+    def setUp(self):
+        from scripts.backfill_firms_archive import month_chunks, build_plan, MAX_DAY_RANGE
+        self.month_chunks = month_chunks
+        self.build_plan = build_plan
+        self.max_day_range = MAX_DAY_RANGE
+
+    def test_chunks_never_exceed_the_api_day_range_limit(self):
+        for year in range(2020, 2026):
+            for month in range(1, 13):
+                for _, span in self.month_chunks(year, month):
+                    self.assertLessEqual(span, self.max_day_range)
+                    self.assertGreaterEqual(span, 1)
+
+    def test_chunks_cover_every_day_of_a_month_exactly_once(self):
+        from calendar import monthrange
+        for year, month in [(2020, 1), (2020, 2), (2024, 2), (2023, 11), (2025, 12)]:
+            covered = []
+            for start, span in self.month_chunks(year, month):
+                d = datetime.fromisoformat(start).date()
+                covered.extend((d + timedelta(days=i)).day for i in range(span))
+            expected = list(range(1, monthrange(year, month)[1] + 1))
+            self.assertEqual(sorted(covered), expected, f"{year}-{month:02d}")
+            self.assertEqual(len(covered), len(set(covered)), "a day is fetched twice")
+
+    def test_requested_window_costs_what_we_claim(self):
+        """Jan/Oct/Nov/Dec 2020-2025 across three sensors."""
+        plan, _ = self.build_plan(
+            range(2020, 2026), [1, 10, 11, 12],
+            ['MODIS_SP', 'VIIRS_SNPP_SP', 'VIIRS_NOAA20_SP'],
+            today=date(2026, 9, 12))
+        self.assertEqual(len(plan), 270)
+        self.assertLess(len(plan), 5000, "would exceed the MAP_KEY 10-minute budget")
+
+    def test_dates_before_an_instrument_existed_are_not_requested(self):
+        """VIIRS S-NPP launched in 2012; asking it for 2005 wastes a call."""
+        plan, skipped = self.build_plan(
+            [2005], [1], ['VIIRS_SNPP_SP'], today=date(2026, 9, 12))
+        self.assertEqual(plan, [])
+        self.assertTrue(skipped)
+        self.assertIn('first light', skipped[0][2])
+
+    def test_future_dates_are_not_requested(self):
+        plan, skipped = self.build_plan(
+            [2030], [1], ['MODIS_SP'], today=date(2026, 9, 12))
+        self.assertEqual(plan, [])
+        self.assertTrue(any('future' in s[2] for s in skipped))
+
+    def test_modis_is_available_for_the_whole_requested_range(self):
+        plan, _ = self.build_plan(range(2020, 2026), [1, 10, 11, 12],
+                                  ['MODIS_SP'], today=date(2026, 9, 12))
+        self.assertEqual(len(plan), 90)
+
+
+class TestFIRMSBackfillUpsert(unittest.TestCase):
+    """
+    SP is the reprocessed version of an NRT detection. It must REPLACE the NRT
+    row, and a later NRT fetch must never downgrade an SP row back.
+    """
+
+    def setUp(self):
+        import db as db_module
+        from scripts.backfill_firms_archive import CLEANED_UPSERT
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, 'upsert.db')
+        schema = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'schema.sql')
+        self.conn = sqlite3.connect(self.db_path)
+        with open(schema, encoding='utf-8') as fh:
+            self.conn.executescript(fh.read())
+        self.conn.commit()
+        self.sql = db_module._to_sqlite(CLEANED_UPSERT)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _row(self, processing, brightness, frp):
+        return (29.0, 75.0, '2020-11-05T05:00:00+00:00', 'MODIS', processing, 'Terra',
+                brightness, brightness, 0, 'ok', frp, '85', 'percent', 'high', 'D',
+                'firms_archive', 0)
+
+    def _stored(self):
+        return self.conn.execute(
+            "SELECT processing, brightness_k_raw, frp_mw FROM cleaned_firms "
+            "WHERE lat = 29.0").fetchone()
+
+    def test_sp_supersedes_an_existing_nrt_row(self):
+        self.conn.execute(self.sql, self._row('NRT', 300.0, 5.0))
+        self.conn.execute(self.sql, self._row('SP', 999.0, 77.0))
+        self.conn.commit()
+        self.assertEqual(self._stored(), ('SP', 999.0, 77.0))
+
+    def test_nrt_never_downgrades_an_sp_row(self):
+        self.conn.execute(self.sql, self._row('SP', 999.0, 77.0))
+        self.conn.execute(self.sql, self._row('NRT', 111.0, 1.0))
+        self.conn.commit()
+        self.assertEqual(self._stored(), ('SP', 999.0, 77.0))
+
+    def test_the_same_detection_is_never_duplicated(self):
+        for _ in range(3):
+            self.conn.execute(self.sql, self._row('NRT', 300.0, 5.0))
+            self.conn.execute(self.sql, self._row('SP', 999.0, 77.0))
+        self.conn.commit()
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM cleaned_firms WHERE lat = 29.0").fetchone()[0]
+        self.assertEqual(count, 1, "an archive backfill duplicated a live detection")
+
+    def test_different_sensors_at_one_place_and_time_stay_separate(self):
+        """MODIS and VIIRS can both see the same fire; those are two observations."""
+        self.conn.execute(self.sql, self._row('SP', 999.0, 77.0))
+        viirs = list(self._row('SP', 350.0, 20.0))
+        viirs[3], viirs[5] = 'VIIRS_SNPP', 'N'
+        self.conn.execute(self.sql, tuple(viirs))
+        self.conn.commit()
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM cleaned_firms WHERE lat = 29.0").fetchone()[0]
+        self.assertEqual(count, 2)

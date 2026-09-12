@@ -47,8 +47,27 @@ load_dotenv()
 FIRMS_MAP_KEY = os.getenv('FIRMS_MAP_KEY')
 
 SENSORS = ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'MODIS_NRT']
+
+# FIRMS area API: west,south,east,north
 INDIA_AREA = '68,6,97,37'
 DAY_RANGE = '1'
+
+# FIRMS names its API sources <FAMILY>_<STREAM>, e.g. MODIS_NRT and MODIS_SP.
+# NRT is near real time; SP is standard processing — the reprocessed archive
+# that supersedes it. The two are stored as SEPARATE columns rather than one
+# string, because putting 'MODIS_NRT' in `sensor` would make a single physical
+# fire detection two rows once the archive backfill covers a period the live
+# fetcher already saw, silently doubling fire counts.
+PROCESSING_STREAMS = ('NRT', 'SP')
+
+
+def split_source(source):
+    """'VIIRS_SNPP_SP' -> ('VIIRS_SNPP', 'SP'). Unknown suffix -> ('<source>', 'NRT')."""
+    for stream in PROCESSING_STREAMS:
+        suffix = f'_{stream}'
+        if source.upper().endswith(suffix):
+            return source[:-len(suffix)], stream
+    return source, 'NRT'
 
 # Brightness temperature column per sensor family. MODIS band 21/22 and VIIRS
 # I-4 are both ~4 micron channels, so they are comparable enough to share a
@@ -161,10 +180,15 @@ def standardise_frame(df, sensor):
             f"(looked for {', '.join(BRIGHTNESS_COLUMNS)}); columns present: {list(df.columns)}"
         )
 
-    df['sensor'] = sensor
+    family, processing = split_source(sensor)
+    df['sensor'] = family
+    df['processing'] = processing
     df['frp_mw'] = pd.to_numeric(df['frp'], errors='coerce') if 'frp' in df.columns else pd.NA
     df['daynight'] = df['daynight'].astype(str) if 'daynight' in df.columns else None
-    df['satellite'] = df['satellite'].astype(str) if 'satellite' in df.columns else sensor
+    # Fall back to the family, not the raw source name: a satellite column
+    # reading 'MODIS_SP' would leak the processing stream into an identity field
+    # that the uniqueness constraint depends on.
+    df['satellite'] = df['satellite'].astype(str) if 'satellite' in df.columns else family
 
     conf = df['confidence'] if 'confidence' in df.columns else pd.Series([None] * len(df))
     normalised = conf.apply(normalise_confidence)
@@ -202,11 +226,14 @@ def main():
             raw_hash = compute_payload_hash(csv_data)
             conn = get_db_connection()
             cur = conn.cursor()
+            family, processing = split_source(sensor)
             execute_many(cur, """
                 INSERT OR IGNORE INTO raw_firms
-                    (timestamp, sensor, raw_data, raw_data_hash, source, is_synthetic)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, [(fetch_time, sensor, csv_data, raw_hash, 'firms', 0)])
+                    (timestamp, sensor, processing, window_days,
+                     raw_data, raw_data_hash, source, is_synthetic)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, [(fetch_time, family, processing, int(DAY_RANGE),
+                   csv_data, raw_hash, 'firms', 0)])
             conn.commit()
             save_raw_data('firms', fetch_time, csv_data, ext='csv')
 
@@ -278,7 +305,8 @@ def main():
         conn = get_db_connection()
         cur = conn.cursor()
         rows = [
-            (float(r.lat), float(r.lon), r.timestamp, r.sensor, str(r.satellite),
+            (float(r.lat), float(r.lon), r.timestamp, r.sensor, r.processing,
+             str(r.satellite),
              _f(r.brightness_k_raw), _f(r.brightness_k_clean),
              int(bool(r.brightness_k_imputed)), r.brightness_k_qc_flag,
              _f(r.frp_mw),
@@ -288,11 +316,11 @@ def main():
         ]
         execute_many(cur, """
             INSERT OR IGNORE INTO cleaned_firms (
-                lat, lon, timestamp, sensor, satellite,
+                lat, lon, timestamp, sensor, processing, satellite,
                 brightness_k_raw, brightness_k_clean, brightness_k_imputed, brightness_k_qc_flag,
                 frp_mw, confidence_raw, confidence_scale, confidence_class, daynight,
                 source, is_synthetic
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, rows)
         conn.commit()
 

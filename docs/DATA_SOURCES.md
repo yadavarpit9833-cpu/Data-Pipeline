@@ -142,6 +142,45 @@ Confidence keeps its raw value plus a `confidence_scale`
 used to log the full URL on every failure. `redact_key()` strips it now. If
 your key has ever appeared in a log or a screenshot, rotate it.
 
+### NRT vs SP, and why they are not different sensors
+
+FIRMS names its API sources `<FAMILY>_<STREAM>`:
+
+| Stream | Meaning | Latency |
+|---|---|---|
+| `NRT` | Near real time | minutes to hours |
+| `SP` | Standard Processing — the reprocessed archive | months behind |
+
+**SP is the same detections, reprocessed.** If `sensor` held the whole source
+string, one physical fire would be stored twice — once as `MODIS_NRT` when the
+live fetcher saw it and again as `MODIS_SP` when the archive backfill reached
+that date — silently doubling the fire counts any model trains on.
+
+So `sensor` holds the FAMILY (`MODIS`, `VIIRS_SNPP`, `VIIRS_NOAA20`) and
+`processing` holds the stream. The uniqueness constraint is on the family, and
+`scripts/backfill_firms_archive.py` upserts with
+`WHERE excluded.processing = 'SP'`: SP supersedes an NRT row, and a later NRT
+fetch can never downgrade an SP row back.
+
+### Historical backfill
+
+| | |
+|---|---|
+| **Endpoint** | `/api/area/csv/{MAP_KEY}/{SOURCE}/{bbox}/{DAY_RANGE}/{START_DATE}` |
+| **DAY_RANGE** | 1–10 days per request (hard limit) |
+| **START_DATE** | returns `START_DATE .. START_DATE + DAY_RANGE - 1` |
+| **Rate limit** | 5000 requests per 10-minute window, per MAP_KEY |
+| **Coverage** | MODIS from Nov 2000, VIIRS S-NPP from Jan 2012, NOAA-20 from 2018 |
+
+`scripts/backfill_firms_archive.py` plans the chunks, skips dates before an
+instrument existed, falls back from SP to NRT where the archive has not been
+produced yet, and records every chunk in `firms_backfill_manifest` so an
+interrupted run resumes instead of restarting.
+
+Sources: [FIRMS Area API](https://firms.modaps.eosdis.nasa.gov/api/area/),
+[FIRMS API in Python](https://firms.modaps.eosdis.nasa.gov/content/academy/data_api/firms_api_use.html),
+[FIRMS Data Availability API](https://firms.modaps.eosdis.nasa.gov/api/data_availability/)
+
 ---
 
 ## 5. Copernicus CAMS — `raw_cams`, `cleaned_cams`

@@ -120,6 +120,75 @@ def count_rows(cur, table):
     return cur.fetchone()[0]
 
 
+# Columns added after a table's first release. CREATE TABLE IF NOT EXISTS will
+# not add them to a database that already has the table, so they are applied
+# explicitly.
+ADDED_COLUMNS = {
+    'raw_firms': [
+        ('processing', "TEXT"),
+        ('window_start', "TEXT"),
+        ('window_days', "INTEGER"),
+    ],
+    'cleaned_firms': [
+        # `sensor` holds the instrument FAMILY and `processing` the stream
+        # (NRT / SP). Rows written before the split stored 'MODIS_NRT' in
+        # `sensor`, so they are normalised below.
+        ('processing', "TEXT DEFAULT 'NRT'"),
+    ],
+}
+
+# Old `sensor` value -> (family, processing)
+SENSOR_NORMALISATION = [
+    ('MODIS_NRT', 'MODIS', 'NRT'),
+    ('MODIS_SP', 'MODIS', 'SP'),
+    ('VIIRS_SNPP_NRT', 'VIIRS_SNPP', 'NRT'),
+    ('VIIRS_SNPP_SP', 'VIIRS_SNPP', 'SP'),
+    ('VIIRS_NOAA20_NRT', 'VIIRS_NOAA20', 'NRT'),
+    ('VIIRS_NOAA20_SP', 'VIIRS_NOAA20', 'SP'),
+    ('VIIRS_NOAA21_NRT', 'VIIRS_NOAA21', 'NRT'),
+]
+
+
+def add_missing_columns(cur, verbose=True):
+    """Adds columns introduced after a table already existed."""
+    added = 0
+    for table, columns in ADDED_COLUMNS.items():
+        if not table_exists(cur, table):
+            continue
+        existing = columns_of(cur, table)
+        for name, decl in columns:
+            if name not in existing:
+                cur.execute(f"ALTER TABLE [{table}] ADD COLUMN [{name}] {decl}")
+                added += 1
+                if verbose:
+                    print(f"  added {table}.{name}")
+    return added
+
+
+def normalise_firms_sensors(cur, verbose=True):
+    """
+    Splits legacy 'MODIS_NRT'-style values into sensor + processing.
+
+    Without this the archive backfill would treat every pre-existing row as a
+    different sensor from the one it fetches, and the same fire would be stored
+    twice — once as 'MODIS_NRT' and once as 'MODIS'.
+    """
+    if not table_exists(cur, 'cleaned_firms'):
+        return 0
+    if 'processing' not in columns_of(cur, 'cleaned_firms'):
+        return 0
+    updated = 0
+    for legacy, family, processing in SENSOR_NORMALISATION:
+        cur.execute(
+            "UPDATE cleaned_firms SET sensor = ?, processing = ? WHERE sensor = ?",
+            (family, processing, legacy))
+        if cur.rowcount:
+            updated += cur.rowcount
+            if verbose:
+                print(f"  normalised {cur.rowcount} row(s): {legacy} -> {family} / {processing}")
+    return updated
+
+
 def migrate(db_path, assume_yes=False):
     if not os.path.exists(db_path):
         print(f"No database at {db_path}. Nothing to migrate — "
@@ -153,7 +222,25 @@ def migrate(db_path, assume_yes=False):
     else:
         print("\n  No synthetic GFS rows found.")
 
-    if not pending_tables and not total_synthetic:
+    missing_columns = [
+        (t, c) for t, cols in ADDED_COLUMNS.items() if table_exists(cur, t)
+        for c, _ in cols if c not in columns_of(cur, t)
+    ]
+    legacy_sensors = 0
+    if table_exists(cur, 'cleaned_firms'):
+        placeholders = ','.join('?' for _ in SENSOR_NORMALISATION)
+        cur.execute(f"SELECT COUNT(*) FROM cleaned_firms WHERE sensor IN ({placeholders})",
+                    [legacy for legacy, _, _ in SENSOR_NORMALISATION])
+        legacy_sensors = cur.fetchone()[0]
+
+    if missing_columns:
+        print(f"\n  ADD COLUMNS: {', '.join(f'{t}.{c}' for t, c in missing_columns)}")
+    if legacy_sensors:
+        print(f"  NORMALISE {legacy_sensors} FIRMS row(s) from 'MODIS_NRT'-style names")
+        print("    into sensor (family) + processing (NRT/SP), so the archive")
+        print("    backfill updates them instead of duplicating every fire.")
+
+    if not pending_tables and not total_synthetic and not missing_columns and not legacy_sensors:
         print("\nDatabase already migrated. Nothing to do.")
         conn.close()
         return 0
@@ -181,6 +268,13 @@ def migrate(db_path, assume_yes=False):
             if old_col in existing and new_col not in existing:
                 cur.execute(f"ALTER TABLE [{table}] RENAME COLUMN [{old_col}] TO [{new_col}]")
                 existing.append(new_col)
+
+    added = add_missing_columns(cur)
+    if added:
+        print(f"  {added} column(s) added")
+    normalised = normalise_firms_sensors(cur)
+    if normalised:
+        print(f"  {normalised} FIRMS row(s) normalised to sensor + processing")
 
     if total_synthetic:
         cur.execute("""

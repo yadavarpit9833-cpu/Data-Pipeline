@@ -80,6 +80,26 @@ python db.py             # create the schema
 python scheduler.py      # run continuously
 ```
 
+### Historical fire data
+
+The live FIRMS fetcher only sees the last day. For the stubble-burning and
+winter seasons of past years, use the archive backfill:
+
+```bash
+# See the plan and the API cost first — it fetches nothing
+python scripts/backfill_firms_archive.py --dry-run
+
+# Jan / Oct / Nov / Dec of 2020-2025, three sensors: 270 requests, ~15 min
+python scripts/backfill_firms_archive.py
+
+# Narrower
+python scripts/backfill_firms_archive.py --years 2023,2024 --months 10,11
+```
+
+It is resumable: an interrupted run continues where it stopped. See
+[`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) for why NRT and SP are stored as
+separate `processing` values rather than as different sensors.
+
 Run a single fetcher to check it end to end:
 
 ```bash

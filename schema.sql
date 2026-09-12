@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS raw_firms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT,
     sensor TEXT,
+    processing TEXT,
+    window_start TEXT,
+    window_days INTEGER,
     raw_data TEXT,
     raw_data_hash TEXT,
     source TEXT,
@@ -219,12 +222,23 @@ CREATE TABLE IF NOT EXISTS cleaned_gfs (
 -- confidence_scale records whether confidence_raw is a MODIS percentage
 -- ('percent') or a VIIRS class letter ('class'); confidence_class is the
 -- low/nominal/high value both sensors are mapped onto.
+--
+-- `sensor` is the instrument FAMILY (MODIS, VIIRS_SNPP, VIIRS_NOAA20, ...) and
+-- `processing` is the stream it arrived on: NRT (near real time) or SP
+-- (standard processing, the reprocessed archive). They are separate columns on
+-- purpose. FIRMS names its API sources MODIS_NRT and MODIS_SP, and storing that
+-- whole string in `sensor` would make one physical fire detection two rows --
+-- once when the live fetcher saw it and again when the archive backfill did --
+-- silently doubling fire counts for any overlapping period. The uniqueness
+-- constraint is on the family, so a detection is one row and an SP backfill
+-- UPDATES the NRT row it supersedes rather than duplicating it.
 CREATE TABLE IF NOT EXISTS cleaned_firms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lat REAL,
     lon REAL,
     timestamp TEXT,
     sensor TEXT,
+    processing TEXT DEFAULT 'NRT',
     satellite TEXT,
     brightness_k_raw REAL,
     brightness_k_clean REAL,
