@@ -228,8 +228,24 @@ def fetch_chunk(source, start, day_range):
                 logger.warning(f"  rate limited; waiting {wait}s")
                 time.sleep(wait)
                 continue
-            response.raise_for_status()
+
+            # FIRMS explains a rejected request in the RESPONSE BODY as plain
+            # text ("Invalid MAP_KEY", "Invalid source", a date range message).
+            # raise_for_status() discards that and leaves only "400 Client
+            # Error: Bad Request", which says nothing about the cause. A 4xx is
+            # also not worth retrying four times — the request will be just as
+            # malformed the fourth time.
+            if response.status_code >= 400:
+                detail = redact_key((response.text or '').strip()[:300])
+                message = (f"HTTP {response.status_code} for {source} {start} "
+                           f"+{day_range}d — FIRMS said: {detail or '(empty body)'}")
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise ValueError(message)      # no retry: our request is wrong
+                raise requests.exceptions.HTTPError(message)
+
             return response.text
+        except ValueError as e:
+            raise                                   # client error, stop immediately
         except requests.exceptions.RequestException as e:
             last_err = e
             logger.warning(f"  attempt {attempt + 1}/{MAX_RETRIES} failed: {redact_key(e)}")
