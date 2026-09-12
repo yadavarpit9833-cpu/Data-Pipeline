@@ -1024,3 +1024,85 @@ class TestFIRMSBackfillUpsert(unittest.TestCase):
         count = self.conn.execute(
             "SELECT COUNT(*) FROM cleaned_firms WHERE lat = 29.0").fetchone()[0]
         self.assertEqual(count, 2)
+
+
+class TestParquetTypeHarmonisation(unittest.TestCase):
+    """
+    BUG: save_cleaned_data_parquet harmonised column types on the INCOMING
+    frame, then merged it with the stored partition and wrote the RESULT — which
+    was never harmonised. MODIS reports FIRMS `confidence` as an integer
+    percentage and VIIRS as a class letter, so the merged column held both and
+    every write failed with
+
+        Could not convert 'n' with type str: tried to convert to int64
+
+    The SQLite write succeeded, so the run reported detections stored while the
+    gold layer, which reads Parquet, received no fire data at all.
+    """
+
+    def setUp(self):
+        import storage
+        self.storage = storage
+        self.tmp = tempfile.mkdtemp()
+        self._orig = storage.DATA_DIR
+        storage.DATA_DIR = self.tmp
+
+    def tearDown(self):
+        self.storage.DATA_DIR = self._orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _modis_rows(self):
+        return pd.DataFrame({
+            'lat': [28.6], 'lon': [77.2], 'timestamp': ['2024-11-01T05:00:00+00:00'],
+            'satellite': ['Terra'], 'sensor': ['MODIS'],
+            'confidence': [85],                     # integer percentage
+            'brightness_k_raw': [330.0],
+        })
+
+    def _viirs_rows(self):
+        return pd.DataFrame({
+            'lat': [22.5], 'lon': [88.3], 'timestamp': ['2024-11-01T07:00:00+00:00'],
+            'satellite': ['N'], 'sensor': ['VIIRS_SNPP'],
+            'confidence': ['n'],                    # class letter
+            'brightness_k_raw': [350.0],
+        })
+
+    def _write(self, frame):
+        return save_cleaned_data_parquet(
+            frame, source='firms', partition_key='date', partition_value='2024-11-01',
+            dedup_keys=['lat', 'lon', 'timestamp', 'satellite', 'sensor'],
+            pure_overwrite=False)
+
+    def test_two_sensors_with_clashing_confidence_types_both_persist(self):
+        self.assertIsNotNone(self._write(self._modis_rows()), 'MODIS write failed')
+        path = self._write(self._viirs_rows())
+        self.assertIsNotNone(path, 'VIIRS write into a MODIS partition failed again')
+
+        stored = pd.read_parquet(path)
+        self.assertEqual(len(stored), 2, 'a sensor was lost from the partition')
+        self.assertEqual(sorted(stored['confidence'].astype(str)), ['85', 'n'])
+
+    def test_order_does_not_matter(self):
+        self.assertIsNotNone(self._write(self._viirs_rows()))
+        self.assertIsNotNone(self._write(self._modis_rows()))
+
+    def test_numeric_columns_stay_numeric(self):
+        """Harmonising must not turn every measurement into text."""
+        path = self._write(self._modis_rows())
+        stored = pd.read_parquet(path)
+        self.assertTrue(pd.api.types.is_numeric_dtype(stored['brightness_k_raw']))
+        self.assertTrue(pd.api.types.is_numeric_dtype(stored['lat']))
+
+    def test_mixed_type_detection(self):
+        from storage import _is_mixed_type
+        self.assertTrue(_is_mixed_type(pd.Series([85, 'n'], dtype=object)))
+        self.assertFalse(_is_mixed_type(pd.Series([85, 20], dtype=object)))
+        self.assertFalse(_is_mixed_type(pd.Series([1, 2.5], dtype=object)))
+        self.assertFalse(_is_mixed_type(pd.Series(['n', 'h'], dtype=object)))
+        self.assertFalse(_is_mixed_type(pd.Series([None, None], dtype=object)))
+
+    def test_missing_values_still_survive(self):
+        frame = self._modis_rows()
+        frame['daynight'] = [None]
+        path = self._write(frame)
+        self.assertTrue(pd.isna(pd.read_parquet(path)['daynight'].iloc[0]))

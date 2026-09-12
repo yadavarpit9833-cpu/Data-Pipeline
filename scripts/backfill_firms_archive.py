@@ -64,8 +64,7 @@ from cleaning import clean_and_impute                                    # noqa:
 from storage import save_raw_data, save_cleaned_data_parquet            # noqa: E402
 from contracts import validate                                           # noqa: E402
 from fetch_firms import (                                                # noqa: E402
-    standardise_frame, format_firms_timestamp, redact_key, split_source,
-    INDIA_AREA,
+    standardise_frame, format_firms_timestamp, redact_key, INDIA_AREA,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -349,9 +348,17 @@ WHERE excluded.processing = 'SP'
 
 
 def store_chunk(conn, frame, source, start):
-    """QC, validate and upsert one chunk. Returns the number of rows stored."""
+    """
+    QC, validate and upsert one chunk.
+
+    Returns (rows_stored, parquet_ok). The second value matters: the database
+    write and the Parquet write can succeed independently, and the gold layer
+    reads Parquet. A chunk whose rows reached SQLite but not Parquet is NOT
+    done, and recording it as success would hide fire data from every
+    downstream table while the run reported itself healthy.
+    """
     if frame.empty:
-        return 0
+        return 0, True
 
     # Range check only. Consecutive rows here are SEPARATE FIRES, not readings
     # from one instrument, so step and flatline checks are meaningless — the
@@ -371,7 +378,7 @@ def store_chunk(conn, frame, source, start):
     frame, failures = validate(frame, 'firms')
     if frame.empty:
         logger.warning(f"  {source} {start}: all rows failed contract validation")
-        return 0
+        return 0, True
     if not failures.empty:
         logger.warning(f"  {source} {start}: "
                        f"{len(failures['index'].dropna().unique())} rows dropped by contract")
@@ -391,14 +398,17 @@ def store_chunk(conn, frame, source, start):
     # Parquet is partitioned by observation date, so one chunk spanning ten
     # days writes into up to ten partitions.
     frame['_date'] = frame['timestamp'].str.slice(0, 10)
+    parquet_ok = True
     for day, group in frame.groupby('_date'):
-        save_cleaned_data_parquet(
+        written = save_cleaned_data_parquet(
             group.drop(columns=['_date']), source='firms',
             partition_key='date', partition_value=day,
             dedup_keys=['lat', 'lon', 'timestamp', 'satellite', 'sensor'],
             pure_overwrite=False,
         )
-    return len(rows)
+        if written is None:
+            parquet_ok = False
+    return len(rows), parquet_ok
 
 
 def _f(v):
@@ -410,6 +420,50 @@ def _s(v):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+
+def rebuild_parquet_from_db(conn):
+    """
+    Regenerates the Parquet partitions from cleaned_firms, making no API calls.
+
+    Needed because the database write and the Parquet write are independent:
+    a run can store every detection in SQLite and still fail to write Parquet,
+    which is exactly what happened while two sensors' `confidence` columns had
+    clashing types. The rows are already paid for; re-downloading them to fix a
+    serialisation bug would waste both quota and an hour.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT lat, lon, timestamp, sensor, processing, satellite,
+               brightness_k_raw, brightness_k_clean, brightness_k_imputed,
+               brightness_k_qc_flag, frp_mw, confidence_raw, confidence_scale,
+               confidence_class, daynight, source, is_synthetic
+        FROM cleaned_firms
+    """)
+    columns = [d[0] for d in cur.description]
+    frame = pd.DataFrame(cur.fetchall(), columns=columns)
+    if frame.empty:
+        print('  cleaned_firms is empty — nothing to rebuild.')
+        return 0
+
+    frame['_date'] = frame['timestamp'].astype(str).str.slice(0, 10)
+    written = failed = 0
+    for day, group in frame.groupby('_date'):
+        path = save_cleaned_data_parquet(
+            group.drop(columns=['_date']), source='firms',
+            partition_key='date', partition_value=day,
+            dedup_keys=['lat', 'lon', 'timestamp', 'satellite', 'sensor'],
+            pure_overwrite=True,       # the database is the source of truth here
+        )
+        if path:
+            written += 1
+        else:
+            failed += 1
+            print(f'  FAILED: date={day}')
+
+    print(f"  rebuilt {written} partition(s) from {len(frame)} rows"
+          + (f", {failed} failed" if failed else ''))
+    return failed
+
 
 def parse_int_list(text, name):
     values = []
@@ -441,6 +495,10 @@ def main(argv=None):
                         help='seconds between requests (default: 1.0)')
     parser.add_argument('--dry-run', action='store_true',
                         help='show the plan and the API cost, fetch nothing')
+    parser.add_argument('--rebuild-parquet', action='store_true',
+                        help='regenerate the Parquet lake from cleaned_firms and '
+                             'exit. Makes no API calls — use this when the rows '
+                             'reached the database but Parquet writes failed.')
     parser.add_argument('--no-resume', action='store_true',
                         help='re-fetch every chunk, including completed ones')
     parser.add_argument('--no-availability-check', action='store_true',
@@ -450,6 +508,17 @@ def main(argv=None):
                         help='also re-check windows previously recorded as empty '
                              '(useful when SP may have been produced since)')
     args = parser.parse_args(argv)
+
+    if args.rebuild_parquet:
+        init_db()
+        conn = get_db_connection()
+        print()
+        print('=== Rebuilding the FIRMS Parquet lake from the database ===')
+        print('    (no API calls)')
+        try:
+            return 1 if rebuild_parquet_from_db(conn) else 0
+        finally:
+            conn.close()
 
     years = parse_int_list(args.years, 'years')
     months = parse_int_list(args.months, 'months')
@@ -509,7 +578,7 @@ def main(argv=None):
         print(f"  already fetched      : {len(done)} chunk(s) — resuming")
 
     print()
-    stored = attempted = failed = empty = 0
+    stored = attempted = failed = empty = partial = 0
     try:
         for index, (source, start, span) in enumerate(plan, 1):
             if (source, start) in done:
@@ -551,14 +620,24 @@ def main(argv=None):
                 lake_path = save_raw_data('firms_archive', start, csv_text, ext='csv')
 
                 frame = parse_chunk(csv_text, used_source, start)
-                count = store_chunk(conn, frame, used_source, start)
+                count, parquet_ok = store_chunk(conn, frame, used_source, start)
                 stored += count
 
-                record_chunk(conn, source, start, span, 'success', count, sha,
-                             lake_path, None if used_source == source
-                             else f'fell back to {used_source}')
-                note = '' if used_source == source else f' (via {used_source})'
-                print(f"{label}: {count} detections{note}")
+                # 'partial' is deliberately not in the resume skip set, so the
+                # next run retries the chunk and repairs its Parquet partition.
+                status = 'success' if parquet_ok else 'partial'
+                if not parquet_ok:
+                    partial += 1
+                note = None if used_source == source else f'fell back to {used_source}'
+                if not parquet_ok:
+                    note = f"{note + '; ' if note else ''}parquet write failed"
+                record_chunk(conn, source, start, span, status, count, sha,
+                             lake_path, note)
+
+                suffix = '' if used_source == source else f' (via {used_source})'
+                if not parquet_ok:
+                    suffix += '  [PARQUET FAILED - will retry next run]'
+                print(f"{label}: {count} detections{suffix}")
 
             except Exception as e:
                 failed += 1
@@ -578,10 +657,11 @@ def main(argv=None):
     print(f"  chunks attempted : {attempted}")
     print(f"  detections stored: {stored}")
     print(f"  empty windows    : {empty}")
+    print(f"  partial chunks   : {partial}  (database written, Parquet failed)")
     print(f"  failed chunks    : {failed}")
-    if failed:
+    if failed or partial:
         print()
-        print('  Re-run to retry the failures; successful chunks are skipped.')
+        print('  Re-run to retry the failed and partial chunks; completed ones are skipped.')
     print()
     print('  Next: python gold_layer.py   # rebuild the gold tables over the new data')
     return 1 if failed and not stored else 0

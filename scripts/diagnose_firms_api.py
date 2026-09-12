@@ -16,7 +16,6 @@ Nothing here writes to the database.
 
 import os
 import sys
-import json
 
 import requests
 from dotenv import load_dotenv

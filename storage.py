@@ -20,6 +20,7 @@ import json
 import hashlib
 import tempfile
 import logging
+import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
@@ -84,22 +85,74 @@ def save_raw_data(source, timestamp_str, payload, ext='json'):
         return None
 
 
-def _stringify_object_columns(df):
+def _type_category(value):
     """
-    Casts object columns to string for Parquet without destroying missing
-    values. `astype(str)` renders NaN as the four-character string 'nan' on
-    some pandas versions, which silently becomes a real value downstream.
+    Buckets a value into 'number', 'text', 'bool' or its type name.
+
+    Comparing type() directly does not work here: a float64 Series returns
+    numpy.float64 from .iloc[0] but plain Python floats when iterated, so an
+    entirely numeric column looked mixed.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return 'bool'
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return 'number'
+    if isinstance(value, str):
+        return 'text'
+    return type(value).__name__
+
+
+def _is_mixed_type(series):
+    """
+    True when a column holds more than one kind of value among its non-nulls.
+
+    This is what pyarrow cannot infer a type for. FIRMS is the live example:
+    MODIS reports `confidence` as an integer percentage (85) and VIIRS as a
+    class letter ('n'), so a partition holding both fails with
+        Could not convert 'n' with type str: tried to convert to int64
+    """
+    values = series.dropna()
+    if values.empty:
+        return False
+    categories = set()
+    for value in values:
+        categories.add(_type_category(value))
+        if len(categories) > 1:
+            return True
+    return False
+
+
+def _harmonise_for_parquet(df):
+    """
+    Makes a frame safe to write as Parquet without destroying missing values.
+
+    Only textual and object columns are touched. `object` is precisely the
+    dtype pandas uses when it could not resolve a single type, which is what a
+    column merged from two sensors becomes — so casting those to text is both
+    necessary and sufficient. Numeric, boolean and datetime columns keep their
+    types.
+
+    Casting only the non-null values matters: `astype(str)` renders NaN as the
+    four-character string 'nan' on some pandas versions, which then reads back
+    as a real value.
     """
     out = df.copy()
     for col in out.columns:
-        # pandas 3 gives string columns a dedicated 'str' dtype, and
-        # select_dtypes(include=['object']) warns about matching it. Checking
-        # the dtype directly works the same on pandas 2 and 3.
         dtype = out[col].dtype
-        if dtype == object or pd.api.types.is_string_dtype(dtype):
-            mask = out[col].notna()
-            out[col] = out[col].where(~mask, out[col][mask].astype(str))
+        if not (dtype == object or pd.api.types.is_string_dtype(dtype)):
+            continue
+        if dtype == object and _is_mixed_type(out[col]):
+            logger.info(
+                f"Column {col!r} holds more than one value type "
+                f"(a provider-specific field such as FIRMS confidence); "
+                f"storing it as text so the partition stays readable.")
+        mask = out[col].notna()
+        out[col] = out[col].where(~mask, out[col][mask].astype(str))
     return out
+
+
+# Kept as an alias: the previous name is referenced by the regression suite.
+_stringify_object_columns = _harmonise_for_parquet
 
 
 def save_cleaned_data_parquet(df, source, partition_key, partition_value,
@@ -123,7 +176,7 @@ def save_cleaned_data_parquet(df, source, partition_key, partition_value,
 
     temp_path = None
     try:
-        df_to_save = _stringify_object_columns(df)
+        df_to_save = df
 
         if not pure_overwrite and os.path.exists(file_path):
             existing = pd.read_parquet(file_path)
@@ -139,6 +192,16 @@ def save_cleaned_data_parquet(df, source, partition_key, partition_value,
                     f"{source} frame; writing without deduplication."
                 )
             df_to_save = combined
+
+        # BUGFIX: this used to run on `df` BEFORE the merge, so the frame that
+        # was actually written — the concatenation of the stored partition and
+        # the new rows — was never harmonised. A column that arrived as int64
+        # from one sensor and as text from another became mixed only at that
+        # point, and every FIRMS Parquet write failed with
+        #   Could not convert 'n' with type str: tried to convert to int64
+        # while the SQLite write succeeded, so the run looked healthy and the
+        # gold layer silently had no fire data.
+        df_to_save = _harmonise_for_parquet(df_to_save)
 
         fd, temp_path = tempfile.mkstemp(suffix='.parquet.tmp', dir=target_dir)
         os.close(fd)
