@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install ecCodes (needed by cfgrib for GFS GRIB2 decoding)
+        run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-data
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python -m unittest discover -s . -p "test_*.py" -v
+
+      - name: Verify the schema applies cleanly
+        env:
+          SQLITE_DB_PATH: ci_check.db
+        run: python db.py
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      # Syntax errors and undefined names only — this is a gate against broken
+      # code reaching the branch, not a style argument.
+      - run: ruff check --select E9,F63,F7,F82 .

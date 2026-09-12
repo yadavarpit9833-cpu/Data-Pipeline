@@ -1,7 +1,5 @@
 import os
-import sqlite3
 import pandas as pd
-from datetime import datetime
 from db import get_db_connection
 from storage import save_raw_data, save_cleaned_data_parquet, DATA_DIR
 

@@ -1,9 +1,28 @@
+# Secrets
 .env
+
+# Python
 .venv/
+venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Local data stores
 *.db
+*.db-wal
+*.db-shm
+env_data_backup_*.db
 raw/
 data/
 
+# Logs
 *.log
-*.csv
+*.log.*
+
+# GRIB index sidecars written by cfgrib
+*.idx
+
+# Editor
+.DS_Store

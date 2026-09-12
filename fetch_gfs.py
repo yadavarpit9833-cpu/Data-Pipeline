@@ -1,398 +1,444 @@
+"""
+fetch_gfs.py — NOAA GFS 0.25 degree forecast grid for the India bounding box.
+
+Three things were wrong with the previous version and are fixed here.
+
+1. FAKE DATA POISONED THE DATABASE.
+   On any fetch error the fetcher wrote a hardcoded 14,625-point grid of
+   25.0 C / 1.0 m/s / 0.0 mm and tagged it is_synthetic=1. Because the cycle
+   label was always "<today>_00z" and the insert used INSERT OR IGNORE against
+   UNIQUE(lat, lon, cycle, fhr), the fake rows written at 00:30 UTC
+   permanently blocked the real rows fetched later the same day, while the
+   Parquet writer (pure_overwrite=True) took the real data. The two stores
+   silently disagreed. There is no synthetic fallback any more: a failed fetch
+   returns 'failure' and writes nothing.
+
+2. IT NEVER FETCHED A FORECAST.
+   cycle_hour was hardcoded to '00' and fhr to '000'. f000 is the analysis,
+   not a forecast, so the "forecast pipeline" contained no forecast at all —
+   and the 00:30 UTC run asked for a cycle NOMADS had not published yet
+   (00z lands around 03:30-05:00 UTC), so it failed nearly every day. The
+   cycle is now chosen from the wall clock minus a publication lag, and every
+   forecast hour in GFS_FORECAST_HOURS is fetched.
+
+3. THE GRIB2 PARSER DECODED THE WRONG NUMBERS.
+   The hand-written parser assumed Data Representation Template 5.0 (simple
+   packing) without ever reading the template number, while NOAA's pgrb2 files
+   use complex packing with spatial differencing (5.2/5.3). It also ignored
+   the Section 6 bitmap, ignored the scanning-mode flags (GFS scans north to
+   south, so the grid came out latitude-flipped), swapped Di/Dj, and read
+   GRIB2's sign-bit scale factors as two's complement. Parsing is now done by
+   cfgrib/ecCodes, which were already in requirements.txt but unused.
+"""
+
 import os
 import time
-import math
-import struct
+import hashlib
 import logging
+import tempfile
 import requests
-import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from db import get_db_connection, execute_query, init_db
+
+from db import get_db_connection, execute_many, init_db
 from cleaning import clean_and_impute
 from storage import save_raw_data, save_cleaned_data_parquet
 from contracts import validate
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fetch_gfs')
 
 load_dotenv()
 
-# India Bounding Box: lat 6.0 to 37.0, lon 68.0 to 97.0
-# At 0.25° GFS resolution: 125 latitude points × 117 longitude points = 14,625 grid points
-LAT_MIN, LAT_MAX, LAT_STEP = 6.0, 37.0, 0.25
-LON_MIN, LON_MAX, LON_STEP = 68.0, 97.0, 0.25
+# India bounding box. At 0.25 degree resolution this is 125 x 117 = 14,625 points.
+LAT_MIN, LAT_MAX = 6.0, 37.0
+LON_MIN, LON_MAX = 68.0, 97.0
+GRID_RESOLUTION = 0.25
+EXPECTED_GRIDPOINTS = 14625
+
+NOMADS_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+
+# NOAA publishes a cycle over roughly 3.5-5 hours after its nominal time.
+# Asking for a cycle sooner than this reliably returns an HTML error page.
+GFS_PUBLICATION_LAG_HOURS = float(os.getenv('GFS_PUBLICATION_LAG_HOURS', '5'))
+
+# Forecast lead times to download, in hours. Each one is a separate GRIB
+# request and adds ~14,625 rows per cycle, so this is deliberately tunable.
+GFS_FORECAST_HOURS = [
+    h.strip().zfill(3)
+    for h in os.getenv('GFS_FORECAST_HOURS', '000,006,012,024').split(',')
+    if h.strip()
+]
+
+# Subsample the grid for demos: 1 = full 0.25 deg, 2 = 0.5 deg, 4 = 1.0 deg.
+GFS_GRID_STRIDE = max(1, int(os.getenv('GFS_GRID_STRIDE', '1')))
+
+REQUEST_TIMEOUT_S = 60
+MAX_RETRIES = 3
+
+# cfgrib short name -> our column name. GFS names these consistently.
+VAR_MAP = {
+    't2m': 'temperature_c_raw',       # 2 m temperature, Kelvin
+    'tp':  'precipitation_mm_raw',    # total precipitation, kg/m2 == mm
+    'u10': 'u_wind_ms_raw',           # 10 m u wind, m/s
+    'v10': 'v_wind_ms_raw',           # 10 m v wind, m/s
+}
+
+
+# ── Cycle selection ──────────────────────────────────────────────────────────
+
+def latest_available_cycle(now_utc=None, lag_hours=None):
+    """
+    Returns the most recent GFS cycle that NOAA has had time to publish, as a
+    timezone-aware datetime on a 6-hourly boundary (00/06/12/18 UTC).
+
+    Subtracting the publication lag before snapping to a boundary is what stops
+    the scheduler asking for a cycle that does not exist yet.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    lag = GFS_PUBLICATION_LAG_HOURS if lag_hours is None else lag_hours
+    t = now_utc - timedelta(hours=lag)
+    return t.replace(hour=(t.hour // 6) * 6, minute=0, second=0, microsecond=0)
+
+
+def cycle_label(cycle_dt):
+    """Formats a cycle datetime as the '20260912_06z' label stored in the DB."""
+    return f"{cycle_dt.strftime('%Y%m%d')}_{cycle_dt.strftime('%H')}z"
+
 
 def compute_valid_time(cycle_str, fhr_str):
     """
-    Computes forecast valid time from GFS cycle start time + forecast hour offset (fhr).
-    e.g. cycle '20260909_00z' or '20260909_00' + fhr '003' -> '2026-09-09T03:00:00+00:00'
+    Forecast valid time = cycle start + forecast hour offset.
+    '20260909_00z' + '003' -> '2026-09-09T03:00:00+00:00'
+
+    Raises ValueError on an unparseable cycle. The old version swallowed the
+    error and returned datetime.now(), which silently stamped forecast rows
+    with the download time and destroyed temporal deduplication.
+    """
+    clean_cycle = cycle_str.replace('z', '').replace('Z', '')
+    parts = clean_cycle.split('_')
+    if len(parts) != 2:
+        raise ValueError(f"Malformed GFS cycle label: {cycle_str!r} (expected 'YYYYMMDD_HHz')")
+    dt = datetime.strptime(f"{parts[0]}{parts[1]}", "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    return (dt + timedelta(hours=int(fhr_str))).isoformat()
+
+
+def build_nomads_url(cycle_dt, fhr):
+    """Builds the NOMADS subregion filter URL for one cycle/forecast-hour pair."""
+    date_str = cycle_dt.strftime('%Y%m%d')
+    hh = cycle_dt.strftime('%H')
+    params = (
+        f"?file=gfs.t{hh}z.pgrb2.0p25.f{fhr}"
+        f"&lev_2_m_above_ground=on&lev_10_m_above_ground=on&lev_surface=on"
+        f"&var_TMP=on&var_APCP=on&var_UGRD=on&var_VGRD=on"
+        f"&subregion=&leftlon={LON_MIN}&rightlon={LON_MAX}"
+        f"&toplat={LAT_MAX}&bottomlat={LAT_MIN}"
+        f"&dir=%2Fgfs.{date_str}%2F{hh}%2Fatmos"
+    )
+    return NOMADS_URL + params
+
+
+# ── GRIB2 decoding ───────────────────────────────────────────────────────────
+
+def parse_grib2(path):
+    """
+    Decodes a GRIB2 file into a DataFrame of lat, lon and our four variables.
+
+    cfgrib (ecCodes) handles packing templates, bitmaps and scanning modes.
+    Doing this by hand is what produced wrong values before.
     """
     try:
-        clean_cycle = cycle_str.replace('z', '').replace('Z', '')
-        parts = clean_cycle.split('_')
-        if len(parts) == 2:
-            date_part, hour_part = parts[0], parts[1]
-            dt = datetime.strptime(f"{date_part}{hour_part}", "%Y%m%d%H").replace(tzinfo=timezone.utc)
-        else:
-            dt = datetime.now(timezone.utc)
-        fhr_hrs = int(fhr_str)
-        valid_dt = dt + timedelta(hours=fhr_hrs)
-        return valid_dt.isoformat()
-    except Exception:
-        return datetime.now(timezone.utc).isoformat()
+        import cfgrib
+    except ImportError as e:
+        raise RuntimeError(
+            "cfgrib is required to decode GFS GRIB2 files but is not importable. "
+            "Install the ecCodes system library and the Python bindings:\n"
+            "  Debian/Ubuntu : sudo apt-get install -y libeccodes0 && pip install cfgrib\n"
+            "  conda         : conda install -c conda-forge cfgrib eccodes\n"
+            "The pipeline refuses to guess at GRIB2 packing rather than store wrong numbers."
+        ) from e
 
-def parse_grib2_subregion(content):
+    # indexpath='' stops cfgrib writing .idx files next to a temp file.
+    datasets = cfgrib.open_datasets(path, backend_kwargs={'indexpath': ''})
+
+    merged = None
+    for ds in datasets:
+        present = {short: col for short, col in VAR_MAP.items() if short in ds.data_vars}
+        if not present:
+            continue
+        frame = ds[list(present)].to_dataframe().reset_index()
+        frame = frame.rename(columns=present)
+        cols = ['latitude', 'longitude'] + list(present.values())
+        frame = frame[[c for c in cols if c in frame.columns]]
+        merged = frame if merged is None else merged.merge(
+            frame, on=['latitude', 'longitude'], how='outer'
+        )
+        ds.close()
+
+    if merged is None or merged.empty:
+        raise ValueError("GRIB2 file contained none of the requested variables")
+
+    merged = merged.rename(columns={'latitude': 'lat', 'longitude': 'lon'})
+
+    # GFS longitudes are 0-360; normalise to -180..180 so India stays 68..97.
+    merged['lon'] = ((merged['lon'] + 180.0) % 360.0) - 180.0
+    merged['lat'] = merged['lat'].round(4)
+    merged['lon'] = merged['lon'].round(4)
+
+    # Kelvin -> Celsius. Everything else is already in the unit its name claims.
+    if 'temperature_c_raw' in merged.columns:
+        merged['temperature_c_raw'] = merged['temperature_c_raw'] - 273.15
+
+    for col in VAR_MAP.values():
+        if col not in merged.columns:
+            # APCP does not exist at f000 (zero-length accumulation window).
+            merged[col] = pd.NA
+        merged[col] = pd.to_numeric(merged[col], errors='coerce').round(3)
+
+    if GFS_GRID_STRIDE > 1:
+        lats = sorted(merged['lat'].unique())[::GFS_GRID_STRIDE]
+        lons = sorted(merged['lon'].unique())[::GFS_GRID_STRIDE]
+        merged = merged[merged['lat'].isin(lats) & merged['lon'].isin(lons)]
+
+    return merged.reset_index(drop=True)
+
+
+def download_grib(url):
+    """Downloads one GRIB2 payload, retrying transient failures."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, timeout=REQUEST_TIMEOUT_S)
+            r.raise_for_status()
+            # NOMADS answers 200 with an HTML error page when a cycle is not
+            # published yet or the IP is throttled. Reject it before parsing.
+            if not r.content.startswith(b'GRIB'):
+                head = r.content[:200].decode('utf-8', 'replace').strip()
+                raise ValueError(f"NOMADS returned non-GRIB payload: {head!r}")
+            return r.content
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_err = e
+            logger.warning(f"GFS download attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+    raise last_err
+
+
+def fetch_cycle(cycle_dt, forecast_hours):
     """
-    Pure Python GRIB2 parser for NOAA NOMADS subregion filter payload.
-    Unpacks template 0 (simple packing) for India grid without external C libraries.
+    Downloads and decodes every forecast hour of one cycle.
+
+    Returns (dataframe, manifest_rows). A forecast hour that cannot be
+    retrieved is skipped and reported; it never becomes synthetic data.
     """
-    pos = 0
-    records = {}
-    
-    while pos < len(content) - 4:
-        if content[pos:pos+4] != b'GRIB':
-            # BUGFIX: without this the loop never advances on non-GRIB payloads
-            # (NOMADS returns an HTML error page when a cycle is not yet published,
-            # or when the IP is rate-limited) and the process spins forever at 100% CPU.
-            pos += 1
+    cycle_str = cycle_label(cycle_dt)
+    frames, manifest, errors = [], [], []
+
+    for fhr in forecast_hours:
+        url = build_nomads_url(cycle_dt, fhr)
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        try:
+            payload = download_grib(url)
+        except Exception as e:
+            errors.append(f"f{fhr}: {e}")
+            logger.error(f"GFS cycle {cycle_str} f{fhr} unavailable: {e}")
             continue
 
-        length = int.from_bytes(content[pos+8:pos+16], 'big')
-        if length <= 0 or pos + length > len(content):
-            # Truncated or malformed message: skip past this header, never stall.
-            pos += 4
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix='.grb2')
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(payload)
+            frame = parse_grib2(tmp_path)
+        except Exception as e:
+            errors.append(f"f{fhr}: parse failed: {e}")
+            logger.error(f"GFS cycle {cycle_str} f{fhr} parse failed: {e}")
             continue
-        msg = content[pos:pos+length]
-        pos += length
-        if True:
-            
-            sec_pos = 16
-            sec3, sec4, sec5, sec7 = None, None, None, None
-            while sec_pos < len(msg) - 4:
-                if msg[sec_pos:sec_pos+4] == b'7777': break
-                slen = int.from_bytes(msg[sec_pos:sec_pos+4], 'big')
-                snum = msg[sec_pos+4]
-                if snum == 3: sec3 = msg[sec_pos:sec_pos+slen]
-                elif snum == 4: sec4 = msg[sec_pos:sec_pos+slen]
-                elif snum == 5: sec5 = msg[sec_pos:sec_pos+slen]
-                elif snum == 7: sec7 = msg[sec_pos:sec_pos+slen]
-                sec_pos += slen
-                
-            if not (sec3 and sec4 and sec5 and sec7): continue
-            
-            ni = int.from_bytes(sec3[30:34], 'big')
-            nj = int.from_bytes(sec3[34:38], 'big')
-            lat1 = int.from_bytes(sec3[46:50], 'big', signed=True) / 1e6
-            lon1 = int.from_bytes(sec3[50:54], 'big', signed=True) / 1e6
-            lat2 = int.from_bytes(sec3[55:59], 'big', signed=True) / 1e6
-            lon2 = int.from_bytes(sec3[59:63], 'big', signed=True) / 1e6
-            dlat = int.from_bytes(sec3[63:67], 'big') / 1e6
-            dlon = int.from_bytes(sec3[67:71], 'big') / 1e6
-            
-            cat = sec4[9]
-            param = sec4[10]
-            
-            ref_val = struct.unpack('>f', sec5[11:15])[0]
-            bin_scale = int.from_bytes(sec5[15:17], 'big', signed=True)
-            dec_scale = int.from_bytes(sec5[17:19], 'big', signed=True)
-            nbits = sec5[19]
-            
-            npoints = ni * nj
-            if nbits == 0:
-                # BUGFIX: a constant GRIB field (e.g. APCP that is zero everywhere)
-                # is packed with nbits=0. range(0, 0, 0) raises ValueError, which was
-                # swallowed by main() and silently replaced real data with the
-                # hardcoded 25 deg C fallback grid.
-                values = [ref_val * (10 ** (-dec_scale))] * npoints
-            else:
-                raw_bytes = sec7[5:]
-                if len(raw_bytes) * 8 < nbits * npoints:
-                    continue  # truncated data section
-                bit_str = ''.join(f'{b:08b}' for b in raw_bytes)
-                packed_ints = [int(bit_str[i:i+nbits], 2) for i in range(0, nbits * npoints, nbits)]
-                values = [(ref_val + p * (2 ** bin_scale)) * (10 ** (-dec_scale)) for p in packed_ints]
-            
-            var_name = 'unknown'
-            if cat == 0 and param == 0: var_name = 'temperature_raw'
-            elif cat == 1 and param == 8: var_name = 'precipitation_raw'
-            elif cat == 2 and param == 2: var_name = 'u_wind_raw'
-            elif cat == 2 and param == 3: var_name = 'v_wind_raw'
-            
-            if var_name != 'unknown':
-                if var_name == 'temperature_raw':
-                    values = [round(v - 273.15, 2) for v in values] # K to °C
-                else:
-                    values = [round(v, 2) for v in values]
-                records[var_name] = (ni, nj, lat1, lat2, lon1, lon2, dlat, dlon, values)
-                
-    return records
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
-import hashlib
+        valid_time = compute_valid_time(cycle_str, fhr)
+        frame['cycle'] = cycle_str
+        frame['fhr'] = fhr
+        frame['valid_time'] = valid_time
+        frame['fetched_at'] = fetched_at
+        frames.append(frame)
 
-def compute_payload_hash(data):
-    """Computes SHA-256 hash of raw payload for fast, indexed uniqueness checks."""
-    if isinstance(data, str):
-        b = data.encode('utf-8')
-    elif isinstance(data, bytes):
-        b = data
-    else:
-        b = str(data).encode('utf-8')
-    return hashlib.sha256(b).hexdigest()
+        # The full GRIB2 payload goes to the data lake, content-addressed.
+        # raw_gfs no longer stores a byte slice on every one of its rows.
+        lake_path = save_raw_data('gfs', valid_time, payload, ext='grb2')
+        manifest.append((
+            cycle_str, fhr, valid_time, fetched_at,
+            len(payload), hashlib.sha256(payload).hexdigest(),
+            lake_path, len(frame),
+        ))
+        logger.info(f"GFS {cycle_str} f{fhr}: {len(frame)} gridpoints decoded.")
 
-def fetch_noaa_nomads_gfs():
-    """Primary fetcher: queries NOAA NOMADS subregion filter for India bounding box"""
-    now = datetime.now(timezone.utc)
-    date_str = now.strftime('%Y%m%d')
-    cycle_hour = '00'
-    cycle = f"{date_str}_{cycle_hour}z"
-    fhr = '000'
-    valid_time = compute_valid_time(cycle, fhr)
-    fetched_at = now.isoformat()
-    
-    url = f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?file=gfs.t{cycle_hour}z.pgrb2.0p25.f{fhr}&lev_2_m_above_ground=on&lev_10_m_above_ground=on&lev_surface=on&var_TMP=on&var_APCP=on&var_UGRD=on&var_VGRD=on&subregion=&leftlon={LON_MIN}&rightlon={LON_MAX}&toplat={LAT_MAX}&bottomlat={LAT_MIN}&dir=%2Fgfs.{date_str}%2F{cycle_hour}%2Fatmos"
-    
-    logger.info("Fetching official NOAA GFS 0.25° subregion dataset from NOMADS...")
-    r = requests.get(url, timeout=25)
-    r.raise_for_status()
+    if not frames:
+        raise RuntimeError(
+            f"No forecast hours retrieved for cycle {cycle_str}. " + "; ".join(errors)
+        )
 
-    # BUGFIX: NOMADS answers with HTTP 200 + an HTML error page when the cycle is
-    # not published yet or the IP is throttled. Reject it before parsing.
-    if not r.content.startswith(b'GRIB'):
-        head = r.content[:200].decode('utf-8', 'replace').strip()
-        raise ValueError(f"NOMADS did not return GRIB2 for cycle {cycle} f{fhr}: {head!r}")
+    return pd.concat(frames, ignore_index=True), manifest, errors
 
-    parsed = parse_grib2_subregion(r.content)
-    if 'temperature_raw' not in parsed:
-        raise ValueError("Failed to parse temperature_raw from NOAA GRIB2 response")
-        
-    ni, nj, lat1, lat2, lon1, lon2, dlat, dlon, temps = parsed['temperature_raw']
-    u_winds = parsed.get('u_wind_raw', (0,0,0,0,0,0,0,0, [None]*len(temps)))[8]
-    v_winds = parsed.get('v_wind_raw', (0,0,0,0,0,0,0,0, [None]*len(temps)))[8]
-    precips = parsed.get('precipitation_raw', (0,0,0,0,0,0,0,0, [0.0]*len(temps)))[8]
-    
-    # Generate grid coordinates
-    min_lat, max_lat = min(lat1, lat2), max(lat1, lat2)
-    min_lon, max_lon = min(lon1, lon2), max(lon1, lon2)
-    
-    lats = [round(min_lat + i * dlat, 2) for i in range(nj)]
-    lons = [round(min_lon + j * dlon, 2) for j in range(ni)]
-    
-    grid_rows = []
-    idx = 0
-    
-    for lat in lats:
-        for lon in lons:
-            grid_rows.append({
-                'lat': lat,
-                'lon': lon,
-                'cycle': cycle,
-                'fhr': fhr,
-                'valid_time': valid_time,
-                'fetched_at': fetched_at,
-                'temperature_raw': temps[idx] if idx < len(temps) else None,
-                'precipitation_raw': precips[idx] if idx < len(precips) else 0.0,
-                'u_wind_raw': u_winds[idx] if idx < len(u_winds) else None,
-                'v_wind_raw': v_winds[idx] if idx < len(v_winds) else None,
-            })
-            idx += 1
-            
-    return grid_rows, r.content
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    logger.info("Starting GFS real-time pipeline execution...")
+    logger.info("Starting GFS forecast grid fetch...")
     init_db()
-    
-    now_utc = datetime.now(timezone.utc)
-    date_str = now_utc.strftime('%Y%m%d')
+
+    cycle_dt = latest_available_cycle()
+    cycle_str = cycle_label(cycle_dt)
+    logger.info(
+        f"Selected cycle {cycle_str} (publication lag {GFS_PUBLICATION_LAG_HOURS}h), "
+        f"forecast hours: {', '.join(GFS_FORECAST_HOURS)}"
+    )
+
     try:
-        grid_rows, raw_bytes = fetch_noaa_nomads_gfs()
-        err_note = None
+        df, manifest, fetch_errors = fetch_cycle(cycle_dt, GFS_FORECAST_HOURS)
     except Exception as e:
-        logger.error(
-            f"NOAA NOMADS fetch failed: {e}. "
-            "Falling back to HARDCODED CONSTANT GRID (temperature=25.0 deg C, wind=1.0m/s, precip=0.0mm). "
-            "These are NOT real measurements. Rows will be tagged is_synthetic=True/source='fallback_constant'."
-        )
-        err_note = f"NOAA fetch failed ({e}); used hardcoded constant fallback (NOT Open-Meteo)"
-        lats = [round(float(x), 2) for x in np.arange(LAT_MIN, LAT_MAX + 0.1, LAT_STEP)]
-        lons = [round(float(y), 2) for y in np.arange(LON_MIN, LON_MAX + 0.1, LON_STEP)]
-        cycle_name = f"{date_str}_00z"
-        val_time = compute_valid_time(cycle_name, '000')
-        fetched_at_iso = now_utc.isoformat()
-        grid_rows = []
-        for lat in lats:
-            for lon in lons:
-                grid_rows.append({
-                    'lat': lat, 'lon': lon, 'cycle': cycle_name, 'fhr': '000', 'valid_time': val_time,
-                    'fetched_at': fetched_at_iso,
-                    'temperature_raw': 25.0, 'precipitation_raw': 0.0, 'u_wind_raw': 1.0, 'v_wind_raw': 1.0,
-                    'is_synthetic': True
-                })
-        raw_bytes = b''
+        # No synthetic fallback. A missing cycle is a failed run, not fake data.
+        logger.error(f"GFS fetch failed for cycle {cycle_str}: {e}")
+        return ('failure', 0, str(e))
 
-    if not grid_rows:
-        return ('failure', 0, "No GFS grid data retrieved")
+    df['source'] = 'noaa_gfs'
+    df['is_synthetic'] = 0
 
-    logger.info(f"Retrieved {len(grid_rows)} per-gridpoint records for India bounding box.")
-    
-    # 1. Batch Insert into raw_gfs (Idempotent)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    raw_hash = compute_payload_hash(raw_bytes[:1000] if raw_bytes else b'fallback_gfs')
-    raw_insert_rows = [
-        (r['lat'], r['lon'], r['cycle'], r['fhr'], r['valid_time'], r['fetched_at'],
-         r['temperature_raw'], r['precipitation_raw'], r['u_wind_raw'], r['v_wind_raw'], raw_bytes[:100], raw_hash,
-         'fallback_constant' if r.get('is_synthetic') else 'noaa',
-         1 if r.get('is_synthetic') else 0)
-        for r in grid_rows
-    ]
-    
-    is_sqlite = os.getenv('DB_ENGINE', 'sqlite') == 'sqlite'
-    # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
-    cur.executemany("""
-        INSERT OR IGNORE INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """ if is_sqlite else """
-        INSERT INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
-    """, raw_insert_rows)
-    conn.commit()
-    logger.info(f"Inserted {len(raw_insert_rows)} per-gridpoint records into raw_gfs database table.")
-    conn.close()
-    
-    # Dual-write RAW to data lake
-    save_raw_data('gfs', now_utc.isoformat(), raw_bytes, ext='bin')
-
-
-    # 2. Clean and Impute
-    df = pd.DataFrame(grid_rows)
+    # QC. group_cols=['lat','lon'] is essential: each gridpoint now has a real
+    # time series across forecast hours, so step and flatline checks compare a
+    # point against ITSELF over time. Previously no grouping was passed and all
+    # rows shared one valid_time, so the checks compared neighbouring grid
+    # cells and flagged uniform regions (ocean, clear sky) as stuck sensors.
     qc_params = {
-        'temperature_raw':   {'min_val': -60.0,  'max_val': 60.0,  'max_step_change': 25.0,  'ignore_zero_flatline': False},
-        'precipitation_raw': {'min_val': 0.0,    'max_val': 500.0, 'max_step_change': 100.0, 'ignore_zero_flatline': True},
-        'u_wind_raw':        {'min_val': -150.0, 'max_val': 150.0, 'max_step_change': 50.0,  'ignore_zero_flatline': False},
-        'v_wind_raw':        {'min_val': -150.0, 'max_val': 150.0, 'max_step_change': 50.0,  'ignore_zero_flatline': False},
+        'temperature_c_raw':    {'min_val': -80.0,  'max_val': 60.0,  'max_step_change': 25.0,
+                                 'ignore_zero_flatline': False},
+        'precipitation_mm_raw': {'min_val': 0.0,    'max_val': 500.0, 'max_step_change': 200.0,
+                                 'ignore_zero_flatline': True},
+        'u_wind_ms_raw':        {'min_val': -150.0, 'max_val': 150.0, 'max_step_change': 50.0,
+                                 'ignore_zero_flatline': False},
+        'v_wind_ms_raw':        {'min_val': -150.0, 'max_val': 150.0, 'max_step_change': 50.0,
+                                 'ignore_zero_flatline': False},
     }
-    
     for metric, opts in qc_params.items():
         if metric in df.columns:
             df = clean_and_impute(
-                df, metric, 'valid_time', lat_col='lat', lon_col='lon',
-                min_val=opts['min_val'], max_val=opts['max_val'], max_step_change=opts['max_step_change'],
-                ignore_zero_flatline=opts['ignore_zero_flatline']
+                df, metric, time_col='valid_time', group_cols=['lat', 'lon'],
+                min_val=opts['min_val'], max_val=opts['max_val'],
+                max_step_change=opts['max_step_change'],
+                ignore_zero_flatline=opts['ignore_zero_flatline'],
+                # No spatial KNN: a NaN in a numerical forecast field means the
+                # model did not produce a value there, not that it is missing.
+                lat_col=None, lon_col=None,
             )
-            
-    # Rename columns to match the canonical SQLite schema
-    rename_map = {}
-    for metric in qc_params.keys():
-        base = metric.replace('_raw', '')
-        rename_map[f"{metric}_clean"] = f"{base}_clean"
-        rename_map[f"{metric}_imputed"] = f"{base}_imputed"
-        rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
-    df.rename(columns=rename_map, inplace=True)
-    
-    if 'is_synthetic' not in df.columns:
-        df['is_synthetic'] = False
-        
-    df['source'] = df['is_synthetic'].apply(lambda x: 'fallback_constant' if x else 'noaa')
-    df['is_synthetic'] = df['is_synthetic'].apply(lambda x: 1 if x else 0)
-    
-    # Contract validation ? partial success supported
-    df, failures = validate(df, 'gfs')
-    
-    if df.empty and not failures.empty:
-        logger.error("All GFS data failed contract validation.")
-        return ('failure', 0, f"All rows failed contract validation. {len(failures)} failures.")
-            
-    # 3. Batch Insert into cleaned_gfs (Idempotent)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cleaned_insert_rows = []
-    for _, row in df.iterrows():
-        cleaned_insert_rows.append((
-            float(row['lat']),
-            float(row['lon']),
-            str(row['cycle']),
-            str(row['fhr']),
-            str(row['valid_time']),
-            str(row['fetched_at']),
-            row.get('temperature_raw'),
-            row.get('temperature_clean'),
-            1 if row.get('temperature_imputed') else 0,
-            row.get('temperature_qc_flag', 'ok'),
-            row.get('precipitation_raw'),
-            row.get('precipitation_clean'),
-            1 if row.get('precipitation_imputed') else 0,
-            row.get('precipitation_qc_flag', 'ok'),
-            row.get('u_wind_raw'),
-            row.get('u_wind_clean'),
-            1 if row.get('u_wind_imputed') else 0,
-            row.get('u_wind_qc_flag', 'ok'),
-            row.get('v_wind_raw'),
-            row.get('v_wind_clean'),
-            1 if row.get('v_wind_imputed') else 0,
-            row.get('v_wind_qc_flag', 'ok'),
-            row.get('source'),
-            row.get('is_synthetic')
-        ))
-        
-    cur.executemany("""
-        INSERT OR IGNORE INTO cleaned_gfs (
-            lat, lon, cycle, fhr, valid_time, fetched_at,
-            temperature_raw, temperature_clean, temperature_imputed, temperature_qc_flag,
-            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag,
-            u_wind_raw, u_wind_clean, u_wind_imputed, u_wind_qc_flag,
-            v_wind_raw, v_wind_clean, v_wind_imputed, v_wind_qc_flag,
-            source, is_synthetic
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """ if is_sqlite else """
-        INSERT INTO cleaned_gfs (
-            lat, lon, cycle, fhr, valid_time, fetched_at,
-            temperature_raw, temperature_clean, temperature_imputed, temperature_qc_flag,
-            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag,
-            u_wind_raw, u_wind_clean, u_wind_imputed, u_wind_qc_flag,
-            v_wind_raw, v_wind_clean, v_wind_imputed, v_wind_qc_flag,
-            source, is_synthetic
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-        ) ON CONFLICT DO NOTHING
-    """, cleaned_insert_rows)
-    conn.commit()
-    logger.info(f"Inserted {len(cleaned_insert_rows)} cleaned GFS per-gridpoint records into cleaned_gfs database table.")
-    conn.close()
-    
-    # Dual-write Cleaned to Parquet (pure overwrite for GFS cycles)
-    save_cleaned_data_parquet(
-        df, source='gfs', partition_key='cycle', partition_value=grid_rows[0]['cycle'],
-        dedup_keys=['lat', 'lon', 'valid_time'], pure_overwrite=True
-    )
-    logger.info("Saved cleaned GFS records to Parquet.")
 
-    expected_pts = 14625
-    status = 'success'
-    err = None
-    
-    if len(grid_rows) >= expected_pts and not err_note:
-        status = 'success'
-    elif len(grid_rows) > 0:
+    rename_map = {}
+    for metric in qc_params:
+        base = metric[:-len('_raw')]
+        rename_map[f'{metric}_clean'] = f'{base}_clean'
+        rename_map[f'{metric}_imputed'] = f'{base}_imputed'
+        rename_map[f'{metric}_qc_flag'] = f'{base}_qc_flag'
+    df.rename(columns=rename_map, inplace=True)
+
+    df, failures = validate(df, 'gfs')
+    if df.empty:
+        return ('failure', 0, f"All GFS rows failed contract validation ({len(failures)} failures).")
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        execute_many(cur, """
+            INSERT OR IGNORE INTO gfs_fetch_manifest
+                (cycle, fhr, valid_time, fetched_at, payload_bytes, payload_sha256,
+                 lake_path, gridpoints)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, manifest)
+
+        raw_rows = [
+            (float(r.lat), float(r.lon), r.cycle, r.fhr, r.valid_time, r.fetched_at,
+             _f(r.temperature_c_raw), _f(r.precipitation_mm_raw),
+             _f(r.u_wind_ms_raw), _f(r.v_wind_ms_raw), 'noaa_gfs', 0)
+            for r in df.itertuples(index=False)
+        ]
+        execute_many(cur, """
+            INSERT OR IGNORE INTO raw_gfs
+                (lat, lon, cycle, fhr, valid_time, fetched_at,
+                 temperature_c, precipitation_mm, u_wind_ms, v_wind_ms, source, is_synthetic)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, raw_rows)
+
+        cleaned_rows = [
+            (float(r.lat), float(r.lon), r.cycle, r.fhr, r.valid_time, r.fetched_at,
+             _f(r.temperature_c_raw), _f(r.temperature_c_clean),
+             int(bool(r.temperature_c_imputed)), r.temperature_c_qc_flag,
+             _f(r.precipitation_mm_raw), _f(r.precipitation_mm_clean),
+             int(bool(r.precipitation_mm_imputed)), r.precipitation_mm_qc_flag,
+             _f(r.u_wind_ms_raw), _f(r.u_wind_ms_clean),
+             int(bool(r.u_wind_ms_imputed)), r.u_wind_ms_qc_flag,
+             _f(r.v_wind_ms_raw), _f(r.v_wind_ms_clean),
+             int(bool(r.v_wind_ms_imputed)), r.v_wind_ms_qc_flag,
+             'noaa_gfs', 0)
+            for r in df.itertuples(index=False)
+        ]
+        execute_many(cur, """
+            INSERT OR IGNORE INTO cleaned_gfs (
+                lat, lon, cycle, fhr, valid_time, fetched_at,
+                temperature_c_raw, temperature_c_clean, temperature_c_imputed, temperature_c_qc_flag,
+                precipitation_mm_raw, precipitation_mm_clean, precipitation_mm_imputed, precipitation_mm_qc_flag,
+                u_wind_ms_raw, u_wind_ms_clean, u_wind_ms_imputed, u_wind_ms_qc_flag,
+                v_wind_ms_raw, v_wind_ms_clean, v_wind_ms_imputed, v_wind_ms_qc_flag,
+                source, is_synthetic
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, cleaned_rows)
+
+        conn.commit()
+        logger.info(f"Inserted {len(cleaned_rows)} cleaned GFS gridpoint records.")
+    except Exception as e:
+        logger.error(f"Database error during GFS save: {e}")
+        return ('failure', 0, str(e))
+    finally:
+        if conn:
+            conn.close()
+
+    # One Parquet file per cycle. pure_overwrite is safe now because a run
+    # always writes the complete set of forecast hours for that cycle.
+    save_cleaned_data_parquet(
+        df, source='gfs', partition_key='cycle', partition_value=cycle_str,
+        dedup_keys=['lat', 'lon', 'cycle', 'fhr'], pure_overwrite=True,
+    )
+
+    expected = EXPECTED_GRIDPOINTS * len(GFS_FORECAST_HOURS) // (GFS_GRID_STRIDE ** 2)
+    status, err = 'success', None
+    if fetch_errors:
         status = 'partial'
-        err = f"Fetched {len(grid_rows)} of {expected_pts} points. {err_note or ''}".strip()
-    else:
-        status = 'failure'
-        err = "Zero grid points fetched"
-        
+        err = f"{len(fetch_errors)} of {len(GFS_FORECAST_HOURS)} forecast hours unavailable: " \
+              + "; ".join(fetch_errors)
     if not failures.empty:
         status = 'partial'
-        bad_indices = len(failures['index'].dropna().unique())
-        msg = f"{bad_indices} bad rows dropped due to contract violations."
+        msg = f"{len(failures['index'].dropna().unique())} rows dropped by contract validation."
+        err = f"{err} | {msg}" if err else msg
+    if len(df) < expected * 0.9:
+        status = 'partial'
+        msg = f"Got {len(df)} rows, expected about {expected}."
         err = f"{err} | {msg}" if err else msg
 
-    return (status, len(cleaned_insert_rows), err)
+    return (status, len(df), err)
+
+
+def _f(v):
+    """None for NaN/NA, plain float otherwise — sqlite3 rejects numpy NA types."""
+    return None if pd.isna(v) else float(v)
+
 
 if __name__ == "__main__":
-    from datetime import datetime, timezone
     from run_logger import log_run
     _started = datetime.now(timezone.utc).isoformat()
     _result = main()

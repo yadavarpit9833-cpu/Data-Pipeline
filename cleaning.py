@@ -194,18 +194,25 @@ def clean_and_impute(df, value_col, time_col=None, lat_col=None, lon_col=None, g
     else:
         m_fail = pd.Series(False, index=df.index)
         
-    # Build comma-separated flag string per row
-    flags_list = []
-    for idx in df.index:
-        row_flags = []
-        if r_fail.loc[idx]: row_flags.append('range_fail')
-        if s_fail.loc[idx]: row_flags.append('step_fail')
-        if f_fail.loc[idx]: row_flags.append('flatline')
-        if m_fail.loc[idx]: row_flags.append('mad_outlier')
-        
-        flags_list.append(','.join(row_flags) if row_flags else 'ok')
-        
-    df[f'{value_col}_qc_flag'] = flags_list
+    # Build the comma-separated flag string per row.
+    # Vectorised: the previous implementation looped over df.index with .loc
+    # per flag, which is four scalar lookups per row. On the GFS grid that is
+    # ~234,000 lookups per metric per run.
+    flag_masks = [
+        ('range_fail', r_fail),
+        ('step_fail', s_fail),
+        ('flatline', f_fail),
+        ('mad_outlier', m_fail),
+    ]
+    parts = [
+        pd.Series(np.where(mask.fillna(False), name, ''), index=df.index)
+        for name, mask in flag_masks
+    ]
+    joined = parts[0]
+    for part in parts[1:]:
+        both = (joined != '') & (part != '')
+        joined = joined + np.where(both, ',', '') + part
+    df[f'{value_col}_qc_flag'] = joined.replace('', 'ok')
     
     # 2. Set clean column (retain original raw value, DO NOT replace flagged values with NaN)
     df[f'{value_col}_clean'] = df[value_col]

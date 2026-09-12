@@ -1,16 +1,38 @@
+"""
+storage.py — Local data lake: content-addressed raw payloads and
+partitioned Parquet for the cleaned (silver) layer.
+
+Fixes in this revision:
+
+  * save_cleaned_data_parquet used to cast every object column with
+    `df[col] = df[col].astype(str)`, mutating the CALLER's DataFrame as a side
+    effect. Depending on the pandas version that also turned NaN into the
+    literal string 'nan', which then round-tripped back into the QC layer via
+    load_historical_context as a value that is neither missing nor numeric.
+    The frame is copied first and missing values are preserved.
+  * A failed write left its temporary file behind in the partition directory,
+    where the next read picked it up as data. Temp files are now cleaned up.
+  * save_raw_data returns the path it wrote, so callers can record lineage.
+"""
+
 import os
 import json
 import hashlib
 import tempfile
+import logging
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-import logging
 
 logger = logging.getLogger('storage')
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+DATA_DIR = os.getenv(
+    'DATA_DIR',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'),
+)
+
 
 def compute_payload_hash(data):
+    """SHA-256 of a payload, used to address raw files by content."""
     if isinstance(data, str):
         b = data.encode('utf-8')
     elif isinstance(data, bytes):
@@ -19,110 +41,153 @@ def compute_payload_hash(data):
         b = json.dumps(data, sort_keys=True).encode('utf-8')
     return hashlib.sha256(b).hexdigest()
 
+
 def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+    os.makedirs(path, exist_ok=True)
+
 
 def save_raw_data(source, timestamp_str, payload, ext='json'):
     """
-    Saves raw unparsed payloads to their natural format in the local data lake.
+    Writes a raw payload to data/raw/<source>/date=YYYY-MM-DD/<sha256>.<ext>.
+
+    Content addressing makes this idempotent: an identical payload fetched
+    twice occupies one file. Returns the path written (or the existing path),
+    or None on failure — raw archival must never break a run.
     """
     try:
         if not timestamp_str:
             timestamp_str = datetime.now(timezone.utc).isoformat()
-        
-        # Simple date extraction
-        date_str = timestamp_str[:10]
+
+        date_str = str(timestamp_str)[:10]
         payload_hash = compute_payload_hash(payload)
-        
+
         target_dir = os.path.join(DATA_DIR, 'raw', source, f"date={date_str}")
         ensure_dir(target_dir)
-        
         file_path = os.path.join(target_dir, f"{payload_hash}.{ext}")
-        
-        if not os.path.exists(file_path):
-            mode = 'wb' if ext == 'bin' or isinstance(payload, bytes) else 'w'
-            with open(file_path, mode) as f:
-                if mode == 'wb':
-                    f.write(payload if isinstance(payload, bytes) else payload.encode('utf-8'))
+
+        if os.path.exists(file_path):
+            return file_path
+
+        is_binary = isinstance(payload, (bytes, bytearray))
+        if is_binary:
+            with open(file_path, 'wb') as f:
+                f.write(payload)
+        else:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                if isinstance(payload, (dict, list)):
+                    json.dump(payload, f, sort_keys=True)
                 else:
-                    if isinstance(payload, dict) or isinstance(payload, list):
-                        json.dump(payload, f)
-                    else:
-                        f.write(str(payload))
+                    f.write(str(payload))
+        return file_path
     except Exception as e:
         logger.error(f"Failed to save raw data for {source}: {e}")
+        return None
 
-def save_cleaned_data_parquet(df, source, partition_key, partition_value, dedup_keys, pure_overwrite=False):
+
+def _stringify_object_columns(df):
     """
-    Saves cleaned tabular data to Parquet using a partition strategy.
-    Implements Read-Merge-Write for continuous sources to prevent data loss on same-day reruns.
+    Casts object columns to string for Parquet without destroying missing
+    values. `astype(str)` renders NaN as the four-character string 'nan' on
+    some pandas versions, which silently becomes a real value downstream.
+    """
+    out = df.copy()
+    for col in out.columns:
+        # pandas 3 gives string columns a dedicated 'str' dtype, and
+        # select_dtypes(include=['object']) warns about matching it. Checking
+        # the dtype directly works the same on pandas 2 and 3.
+        dtype = out[col].dtype
+        if dtype == object or pd.api.types.is_string_dtype(dtype):
+            mask = out[col].notna()
+            out[col] = out[col].where(~mask, out[col][mask].astype(str))
+    return out
+
+
+def save_cleaned_data_parquet(df, source, partition_key, partition_value,
+                              dedup_keys, pure_overwrite=False):
+    """
+    Writes cleaned data to data/cleaned_<source>/<key>=<value>.parquet.
+
+    Continuous sources use read-merge-write so a same-day rerun adds to the
+    partition instead of replacing it. Sources that always produce a complete
+    partition in one run (GFS cycles) pass pure_overwrite=True.
+
+    The write goes to a temporary file and is moved into place with os.replace,
+    which is atomic on POSIX and Windows, so a reader never sees a half file.
     """
     if df is None or df.empty:
-        return
+        return None
 
     target_dir = os.path.join(DATA_DIR, f"cleaned_{source}")
     ensure_dir(target_dir)
-    
     file_path = os.path.join(target_dir, f"{partition_key}={partition_value}.parquet")
-    
+
+    temp_path = None
     try:
-        # Convert all object columns to string to avoid pyarrow inference issues
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].astype(str)
-            
-        if pure_overwrite or not os.path.exists(file_path):
-            df_to_save = df
-        else:
-            # Read-Merge-Write
-            existing_df = pd.read_parquet(file_path)
-            # Combine, placing new data at the end
-            combined = pd.concat([existing_df, df], ignore_index=True)
-            # Deduplicate by unique keys, keeping the last (newest) record
-            df_to_save = combined.drop_duplicates(subset=dedup_keys, keep='last')
-            
-        # Write to temp file then rename for atomic replace
-        fd, temp_path = tempfile.mkstemp(suffix='.parquet', dir=target_dir)
+        df_to_save = _stringify_object_columns(df)
+
+        if not pure_overwrite and os.path.exists(file_path):
+            existing = pd.read_parquet(file_path)
+            combined = pd.concat([existing, df_to_save], ignore_index=True)
+            usable_keys = [k for k in dedup_keys if k in combined.columns]
+            if usable_keys:
+                # keep='last' so the freshly fetched record wins over the
+                # stored one when both describe the same observation.
+                combined = combined.drop_duplicates(subset=usable_keys, keep='last')
+            else:
+                logger.warning(
+                    f"None of the dedup keys {dedup_keys} are present in the "
+                    f"{source} frame; writing without deduplication."
+                )
+            df_to_save = combined
+
+        fd, temp_path = tempfile.mkstemp(suffix='.parquet.tmp', dir=target_dir)
         os.close(fd)
-        
         df_to_save.to_parquet(temp_path, index=False)
-        # On Windows, os.replace guarantees atomic rename and handles existing files
         os.replace(temp_path, file_path)
-        
+        temp_path = None
+        return file_path
     except Exception as e:
         logger.error(f"Failed to save parquet for {source}: {e}")
+        return None
+    finally:
+        # A leftover temp file in the partition directory would be picked up
+        # by the next glob as if it were data.
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
 
 def load_historical_context(source, current_date_str, days_back=1):
     """
-    Loads Parquet data from previous dates to provide historical context for QC checks 
-    (like step change or flatline) across midnight boundaries.
+    Loads recent partitions so QC checks (step change, flatline) have prior
+    readings to compare against across the midnight partition boundary.
+
+    Returns None when there is nothing stored yet.
     """
     try:
         target_dir = os.path.join(DATA_DIR, f"cleaned_{source}")
-        if not os.path.exists(target_dir):
+        if not os.path.isdir(target_dir):
             return None
-            
-        dt = datetime.strptime(current_date_str[:10], '%Y-%m-%d')
-        dfs = []
-        
-        # Load up to `days_back` days + current day (Wait, the QC needs prior context, not future. The current day might not be saved yet).
+
+        dt = datetime.strptime(str(current_date_str)[:10], '%Y-%m-%d')
+        frames = []
+
         for i in range(days_back, 0, -1):
-            past_dt = dt - timedelta(days=i)
-            past_date_str = past_dt.strftime('%Y-%m-%d')
-            file_path = os.path.join(target_dir, f"date={past_date_str}.parquet")
-            
-            if os.path.exists(file_path):
-                dfs.append(pd.read_parquet(file_path))
-                
-        # Also load current day in case there's earlier data in the current day partition!
-        curr_file_path = os.path.join(target_dir, f"date={current_date_str[:10]}.parquet")
-        if os.path.exists(curr_file_path):
-            dfs.append(pd.read_parquet(curr_file_path))
-                
-        if not dfs:
+            past = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
+            path = os.path.join(target_dir, f"date={past}.parquet")
+            if os.path.exists(path):
+                frames.append(pd.read_parquet(path))
+
+        # The current day's partition holds earlier readings from today.
+        current_path = os.path.join(target_dir, f"date={str(current_date_str)[:10]}.parquet")
+        if os.path.exists(current_path):
+            frames.append(pd.read_parquet(current_path))
+
+        if not frames:
             return None
-            
-        return pd.concat(dfs, ignore_index=True)
+        return pd.concat(frames, ignore_index=True)
     except Exception as e:
         logger.warning(f"Failed to load historical context for {source}: {e}")
         return None

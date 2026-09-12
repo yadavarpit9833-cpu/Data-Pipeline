@@ -1,0 +1,28 @@
+services:
+  pipeline:
+    build: .
+    env_file: .env
+    volumes:
+      - pipeline-data:/data
+    restart: unless-stopped
+
+  # Optional PostgreSQL backend. Start with:
+  #   docker compose --profile postgres up
+  # and set DB_ENGINE=postgres, DB_HOST=postgres in your .env.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${DB_NAME:-env_data}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  pipeline-data:
+  postgres-data:

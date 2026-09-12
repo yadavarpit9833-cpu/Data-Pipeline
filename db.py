@@ -1,16 +1,49 @@
+"""
+db.py
+-----
+Connection handling and schema initialisation for the environmental pipeline.
+
+Supports SQLite (default, for local development and demos) and PostgreSQL
+(for deployments where several writers need to run concurrently).
+
+Two things used to be broken here and are now fixed:
+
+1. SQLite connections were opened with no busy timeout and in the default
+   rollback-journal mode. The scheduler starts six jobs at once, so writers
+   collided and raised "database is locked". Connections now use WAL plus a
+   30 s busy timeout, which lets readers and a single writer proceed in
+   parallel and makes short write collisions wait instead of fail.
+
+2. DB_ENGINE=postgres was advertised but could never work: schema.sql is
+   SQLite DDL and contains INTEGER PRIMARY KEY AUTOINCREMENT and BLOB, which
+   Postgres rejects. translate_ddl() converts the SQLite DDL to the Postgres
+   equivalent so one schema file serves both engines.
+"""
+
 import os
+import re
 import sqlite3
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger('db')
+
 DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite').lower()
 SQLITE_DB_PATH = os.getenv('SQLITE_DB_PATH', 'env_data.db')
+SQLITE_BUSY_TIMEOUT_S = float(os.getenv('SQLITE_BUSY_TIMEOUT_S', '30'))
+
+# init_db() is called at the top of every fetcher's main(). Re-reading and
+# re-executing the whole schema every 15 minutes is pure overhead, so the
+# result is memoised per process. Pass force=True to bypass it.
+_SCHEMA_APPLIED = False
+
 
 def get_db_connection():
     """
     Returns a database connection. Defaults to SQLite for local prototyping.
-    Can be switched to PostgreSQL when DB_ENGINE=postgres.
+    Set DB_ENGINE=postgres to use PostgreSQL instead.
     """
     if DB_ENGINE == 'postgres':
         import psycopg2
@@ -19,17 +52,26 @@ def get_db_connection():
             port=os.getenv('DB_PORT', '5432'),
             dbname=os.getenv('DB_NAME', 'env_data'),
             user=os.getenv('DB_USER', 'postgres'),
-            password=os.getenv('DB_PASSWORD', 'your_password')
+            password=os.getenv('DB_PASSWORD', ''),
         )
-    else:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+
+    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_S)
+    conn.row_factory = sqlite3.Row
+    # WAL lets one writer and many readers work concurrently instead of
+    # serialising every access behind an exclusive lock.
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute(f'PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_S * 1000)}')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    return conn
+
 
 def execute_query(cursor, query, params=()):
     """
-    Executes query handling placeholder translation between SQLite (?) and Postgres (%s),
-    as well as conflict handling (INSERT OR IGNORE vs ON CONFLICT DO NOTHING).
+    Executes a query, translating placeholders and upsert syntax between
+    SQLite (?, INSERT OR IGNORE) and Postgres (%s, ON CONFLICT DO NOTHING).
+
+    Queries are written in the Postgres style (%s placeholders) and translated
+    down to SQLite, so there is exactly one direction to reason about.
     """
     if DB_ENGINE == 'postgres':
         if 'INSERT OR IGNORE INTO' in query:
@@ -39,19 +81,75 @@ def execute_query(cursor, query, params=()):
     else:
         query = query.replace('%s', '?')
         if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
-            query = query.replace('INSERT INTO', 'INSERT OR IGNORE INTO').replace(' ON CONFLICT DO NOTHING', '')
-            
+            query = (query
+                     .replace('INSERT INTO', 'INSERT OR IGNORE INTO')
+                     .replace(' ON CONFLICT DO NOTHING', ''))
+
     cursor.execute(query, params)
 
 
-def init_db(schema_file='schema.sql'):
-    """Applies schema.sql to the database."""
+def execute_many(cursor, query, rows):
+    """Batch equivalent of execute_query. Used for the large GFS grid inserts."""
+    if not rows:
+        return
+    if DB_ENGINE == 'postgres':
+        if 'INSERT OR IGNORE INTO' in query:
+            query = query.replace('INSERT OR IGNORE INTO', 'INSERT INTO')
+            if 'ON CONFLICT' not in query:
+                query = query + ' ON CONFLICT DO NOTHING'
+    else:
+        query = query.replace('%s', '?')
+        if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
+            query = (query
+                     .replace('INSERT INTO', 'INSERT OR IGNORE INTO')
+                     .replace(' ON CONFLICT DO NOTHING', ''))
+    cursor.executemany(query, rows)
+
+
+def translate_ddl(schema_sql, engine):
+    """
+    Converts the SQLite DDL in schema.sql to the dialect of `engine`.
+
+    schema.sql stays valid SQLite so `sqlite3 env_data.db < schema.sql` keeps
+    working; only the Postgres path is rewritten.
+
+    SQLite                                  Postgres
+    --------------------------------------  ------------------------------------
+    INTEGER PRIMARY KEY AUTOINCREMENT       GENERATED BY DEFAULT AS IDENTITY
+    BLOB                                    BYTEA
+    """
+    if engine != 'postgres':
+        return schema_sql
+
+    out = re.sub(
+        r'\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b',
+        'INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY',
+        schema_sql,
+        flags=re.IGNORECASE,
+    )
+    # Only the standalone BLOB type, never a column or table name containing it.
+    out = re.sub(r'(?<![\w"])BLOB(?![\w"])', 'BYTEA', out, flags=re.IGNORECASE)
+    return out
+
+
+def init_db(schema_file='schema.sql', force=False):
+    """Applies schema.sql to the database. Idempotent, and memoised per process."""
+    global _SCHEMA_APPLIED
+    if _SCHEMA_APPLIED and not force:
+        return
+
+    # Resolve relative to this file so the fetchers work from any cwd.
+    if not os.path.isabs(schema_file):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), schema_file)
+        if os.path.exists(candidate):
+            schema_file = candidate
+
     if not os.path.exists(schema_file):
         raise FileNotFoundError(f"{schema_file} not found.")
-        
-    with open(schema_file, 'r') as f:
-        schema_sql = f.read()
-        
+
+    with open(schema_file, 'r', encoding='utf-8') as f:
+        schema_sql = translate_ddl(f.read(), DB_ENGINE)
+
     conn = get_db_connection()
     try:
         if DB_ENGINE == 'postgres':
@@ -61,9 +159,13 @@ def init_db(schema_file='schema.sql'):
         else:
             conn.executescript(schema_sql)
             conn.commit()
-        print(f"Database initialized successfully using engine: {DB_ENGINE}")
+        _SCHEMA_APPLIED = True
+        logger.info(f"Database initialised using engine: {DB_ENGINE}")
     finally:
         conn.close()
 
+
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
     init_db()
+    print(f"Database initialized successfully using engine: {DB_ENGINE}")

@@ -18,7 +18,6 @@ Safety:
 import sqlite3
 import pandas as pd
 import os
-import shutil
 
 DB_PATH = 'env_data.db'
 OLD_CYCLE = '00'

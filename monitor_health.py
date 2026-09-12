@@ -1,129 +1,178 @@
 """
-monitor_health.py — Real-Time Data Pipeline Health & Stability Reporter
-Usage: python monitor_health.py
+monitor_health.py — Pipeline health and freshness report.
+
+Usage:
+    python monitor_health.py            # human-readable table
+    python monitor_health.py --json     # machine-readable, for dashboards
+
+Fixes in this revision:
+  * It used sqlite3 and a hardcoded 'env_data.db' directly, so it reported
+    nothing when the pipeline ran against Postgres or a different SQLITE_DB_PATH.
+    It goes through db.get_db_connection() now.
+  * The source list was missing the satellite and gold-layer jobs, so two of
+    six scheduled jobs could fail indefinitely without appearing in the report.
+  * Its exit code is now non-zero when any source is stale or has no
+    successful run, so it can be used as a container healthcheck or in CI.
 """
-import sqlite3
+
+import sys
+import json
+import logging
 from datetime import datetime, timezone, timedelta
 
-DB_PATH = 'env_data.db'
+from db import get_db_connection, execute_query
 
-# Expected run intervals (minutes) and 2x freshness thresholds (minutes)
+logger = logging.getLogger('monitor_health')
+
+# Expected cadence per source, and the age at which we call it stale.
+# The thresholds mirror scheduler.JOBS at roughly 2x the interval.
 SOURCES = {
-    'cpcb':  {'name': 'CPCB Air Quality', 'interval': 15,  'threshold': 30},
-    'firms': {'name': 'FIRMS Active Fires', 'interval': 20,  'threshold': 40},
-    'weather': {'name': 'Open-Meteo Weather', 'interval': 60,  'threshold': 120},
-    'gfs':   {'name': 'GFS Grid Forecast', 'interval': 360, 'threshold': 720},
+    'waqi':    {'name': 'WAQI Air Quality',   'interval_min': 30,  'stale_after_min': 75},
+    'firms':   {'name': 'FIRMS Active Fires', 'interval_min': 20,  'stale_after_min': 50},
+    'weather': {'name': 'Open-Meteo Weather', 'interval_min': 60,  'stale_after_min': 150},
+    'gfs':     {'name': 'GFS Forecast Grid',  'interval_min': 360, 'stale_after_min': 800},
+    'cams':    {'name': 'CAMS Composition',   'interval_min': 1440, 'stale_after_min': 3000},
+    'gold':    {'name': 'Medallion Gold Layer', 'interval_min': 60, 'stale_after_min': 150},
 }
 
+
 def parse_iso(ts_str):
+    """Parses an ISO timestamp, assuming UTC when no offset is present."""
     if not ts_str:
         return None
     try:
-        dt = datetime.fromisoformat(ts_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
+        dt = datetime.fromisoformat(str(ts_str))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except ValueError:
         return None
 
-def main():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
 
-    now_utc = datetime.now(timezone.utc)
+def _value(row, key, index):
+    """Reads a column from either a sqlite3.Row or a plain psycopg2 tuple."""
+    try:
+        return row[key]
+    except (TypeError, IndexError, KeyError):
+        return row[index]
+
+
+def collect_health(now_utc=None):
+    """Gathers per-source health. Returns a list of dicts."""
+    now_utc = now_utc or datetime.now(timezone.utc)
     cutoff_24h = (now_utc - timedelta(hours=24)).isoformat()
 
-    print("=" * 85)
-    print(f" PIPELINE HEALTH & STABILITY SNAPSHOT REPORT — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print("=" * 85)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        report = []
 
-    health_summary = []
-    error_logs = []
+        for source_key, meta in SOURCES.items():
+            execute_query(cur, """
+                SELECT
+                    SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END),
+                    AVG(CASE WHEN status IN ('success', 'partial') THEN rows_inserted END)
+                FROM pipeline_run_log
+                WHERE source = %s AND run_started_at >= %s
+            """, (source_key, cutoff_24h))
+            row = cur.fetchone() or (0, 0, 0, None)
+            successes, partials, failures = (row[0] or 0), (row[1] or 0), (row[2] or 0)
+            avg_rows = round(row[3], 1) if row[3] is not None else 0.0
 
-    for src_key, meta in SOURCES.items():
-        # 1. Total successes, partials, failures in last 24h
-        cur.execute("""
-            SELECT 
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successes,
-                SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) as partials,
-                SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) as failures,
-                AVG(CASE WHEN status = 'success' THEN rows_inserted ELSE NULL END) as avg_rows
-            FROM pipeline_run_log
-            WHERE source = ? AND run_started_at >= ?
-        """, (src_key, cutoff_24h))
-        
-        row = cur.fetchone()
-        successes = row['successes'] or 0
-        partials = row['partials'] or 0
-        failures = row['failures'] or 0
-        avg_rows = round(row['avg_rows'], 1) if row['avg_rows'] is not None else 0.0
+            execute_query(cur, """
+                SELECT run_finished_at FROM pipeline_run_log
+                WHERE source = %s AND status IN ('success', 'partial')
+                ORDER BY id DESC LIMIT 1
+            """, (source_key,))
+            last = cur.fetchone()
+            last_success = _value(last, 'run_finished_at', 0) if last else None
 
-        # 2. Last successful run
-        cur.execute("""
-            SELECT run_finished_at, rows_inserted
-            FROM pipeline_run_log
-            WHERE source = ? AND status = 'success'
-            ORDER BY id DESC LIMIT 1
-        """, (src_key,))
-        last_succ_row = cur.fetchone()
-        last_success_ts = last_succ_row['run_finished_at'] if last_succ_row else "Never"
+            execute_query(cur, """
+                SELECT run_finished_at, status, error_message FROM pipeline_run_log
+                WHERE source = %s AND status IN ('failure', 'partial')
+                ORDER BY id DESC LIMIT 1
+            """, (source_key,))
+            err_row = cur.fetchone()
 
-        # 3. Last failure or partial run
-        cur.execute("""
-            SELECT run_finished_at, status, error_message
-            FROM pipeline_run_log
-            WHERE source = ? AND status IN ('failure', 'partial')
-            ORDER BY id DESC LIMIT 1
-        """, (src_key,))
-        last_err_row = cur.fetchone()
-
-        if last_err_row:
-            error_logs.append({
-                'source': meta['name'],
-                'timestamp': last_err_row['run_finished_at'],
-                'status': last_err_row['status'],
-                'message': last_err_row['error_message'] or 'Unknown error'
-            })
-
-        # 4. Freshness check (2x expected interval)
-        last_succ_dt = parse_iso(last_success_ts)
-        if last_succ_dt:
-            mins_ago = int((now_utc - last_succ_dt).total_seconds() / 60)
-            if mins_ago > meta['threshold']:
-                freshness_status = f"[STALE] ({mins_ago}m ago > {meta['threshold']}m max)"
+            last_dt = parse_iso(last_success)
+            if last_dt is None:
+                state, age_min = 'NO SUCCESSFUL RUNS', None
             else:
-                freshness_status = f"[HEALTHY] ({mins_ago}m ago)"
+                age_min = int((now_utc - last_dt).total_seconds() / 60)
+                state = 'STALE' if age_min > meta['stale_after_min'] else 'HEALTHY'
+
+            report.append({
+                'source': source_key,
+                'name': meta['name'],
+                'state': state,
+                'age_minutes': age_min,
+                'stale_after_minutes': meta['stale_after_min'],
+                'last_success': last_success,
+                'successes_24h': successes,
+                'partials_24h': partials,
+                'failures_24h': failures,
+                'avg_rows': avg_rows,
+                'last_error': {
+                    'at': _value(err_row, 'run_finished_at', 0),
+                    'status': _value(err_row, 'status', 1),
+                    'message': _value(err_row, 'error_message', 2) or 'unknown',
+                } if err_row else None,
+            })
+        return report
+    finally:
+        conn.close()
+
+
+def print_report(report, now_utc):
+    width = 96
+    print("=" * width)
+    print(f" PIPELINE HEALTH REPORT — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("=" * width)
+    print(f"{'Source':<24} | {'Last OK (UTC)':<20} | {'24h S/P/F':<12} | {'Avg rows':<9} | Status")
+    print("-" * width)
+
+    for entry in report:
+        last = (entry['last_success'] or 'Never')[:19].replace('T', ' ')
+        counts = f"{entry['successes_24h']}S / {entry['partials_24h']}P / {entry['failures_24h']}F"
+        if entry['state'] == 'HEALTHY':
+            status = f"[HEALTHY] {entry['age_minutes']}m ago"
+        elif entry['state'] == 'STALE':
+            status = (f"[STALE] {entry['age_minutes']}m ago "
+                      f"(> {entry['stale_after_minutes']}m)")
         else:
-            freshness_status = "[NO SUCCESSFUL RUNS]"
+            status = "[NO SUCCESSFUL RUNS]"
+        print(f"{entry['name']:<24} | {last:<20} | {counts:<12} | {entry['avg_rows']:<9} | {status}")
 
-        health_summary.append({
-            'source': meta['name'],
-            'last_success': last_success_ts[:19].replace('T', ' ') if last_success_ts != "Never" else "Never",
-            '24h_s_p_f': f"{successes}S / {partials}P / {failures}F",
-            'avg_rows': avg_rows,
-            'status': freshness_status
-        })
+    print("=" * width)
 
-    # Print Health Summary Table
-    print(f"{'Source':<22} | {'Last Success (UTC)':<19} | {'24h Runs (S/P/F)':<15} | {'Avg Rows':<10} | {'Freshness / Status'}")
-    print("-" * 85)
-    for h in health_summary:
-        print(f"{h['source']:<22} | {h['last_success']:<19} | {h['24h_s_p_f']:<15} | {h['avg_rows']:<10} | {h['status']}")
-    print("=" * 85)
-
-    # Print Error / Warning Details
-    if error_logs:
-        print("\nRECENT ERRORS & DEGRADED RUN LOGS:")
-        print("-" * 85)
-        for err in error_logs:
-            ts = err['timestamp'][:19].replace('T', ' ') if err['timestamp'] else ''
-            print(f"* [{err['source']}] {ts} [{err['status'].upper()}]: {err['message']}")
-        print("=" * 85)
+    errors = [e for e in report if e['last_error']]
+    if errors:
+        print("\nMOST RECENT FAILURE OR DEGRADED RUN PER SOURCE:")
+        print("-" * width)
+        for entry in errors:
+            err = entry['last_error']
+            when = (err['at'] or '')[:19].replace('T', ' ')
+            print(f"* [{entry['name']}] {when} [{str(err['status']).upper()}]: {err['message']}")
+        print("=" * width)
     else:
         print("\nNo pipeline errors recorded.")
 
-    conn.close()
+
+def main():
+    now_utc = datetime.now(timezone.utc)
+    report = collect_health(now_utc)
+
+    if '--json' in sys.argv:
+        print(json.dumps({'generated_at': now_utc.isoformat(), 'sources': report}, indent=2))
+    else:
+        print_report(report, now_utc)
+
+    # Non-zero exit when anything is unhealthy, so this works as a
+    # container healthcheck or a CI gate.
+    unhealthy = [e for e in report if e['state'] != 'HEALTHY']
+    return 1 if unhealthy else 0
+
 
 if __name__ == '__main__':
-    main()
+    logging.basicConfig(level=logging.WARNING)
+    sys.exit(main())
