@@ -605,3 +605,224 @@ class TestSchedulerConfiguration(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Second audit: bugs found by re-reviewing the fixes above.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestChronologicalSorting(unittest.TestCase):
+    """
+    BUG: the QC checks sorted by the raw timestamp STRING. ISO strings only
+    sort correctly when every value carries the same UTC offset, and this
+    pipeline mixes them routinely — WAQI stamps '...+05:30' while the fallback
+    timestamp and every other source use '...+00:00'. Readings were therefore
+    compared in the wrong temporal order.
+    """
+
+    def test_mixed_utc_offsets_sort_chronologically(self):
+        from cleaning import _sort_for_qc
+        df = pd.DataFrame({
+            'station': ['A', 'A'],
+            # 23:30+05:30 is 18:00 UTC — EARLIER than 20:00+00:00,
+            # but sorts LATER as a string.
+            'timestamp': ['2026-09-12T23:30:00+05:30', '2026-09-12T20:00:00+00:00'],
+            'v': [10.0, 20.0],
+        })
+        # Guard the fixture: a plain string sort must disagree with the true
+        # chronological order, otherwise this test proves nothing.
+        string_order = df.sort_values('timestamp')['v'].tolist()
+        true_order = df.assign(
+            _t=pd.to_datetime(df['timestamp'], utc=True, format='mixed')
+        ).sort_values('_t')['v'].tolist()
+        self.assertNotEqual(string_order, true_order,
+                            "fixture no longer exercises the string-sort trap")
+
+        ordered = _sort_for_qc(df, ['station'], 'timestamp')['v'].tolist()
+        self.assertEqual(ordered, true_order,
+                         "QC is sorting timestamps as strings again")
+
+    def test_step_check_uses_true_time_order(self):
+        """A jump must be measured against the chronologically previous value."""
+        df = pd.DataFrame({
+            'station': ['A'] * 3,
+            'timestamp': ['2026-09-12T18:00:00+00:00',
+                          '2026-09-12T23:30:00+05:30',   # 18:00 UTC + 0h -> 18:00
+                          '2026-09-12T20:00:00+00:00'],
+            'pm25': [50.0, 55.0, 500.0],
+        })
+        out = clean_and_impute(df, 'pm25', time_col='timestamp', group_cols=['station'],
+                               min_val=0.0, max_val=1000.0, max_step_change=300.0)
+        by_time = out.set_index('timestamp')['pm25_qc_flag']
+        self.assertIn('step_fail', by_time['2026-09-12T20:00:00+00:00'])
+
+    def test_internal_sort_key_never_reaches_output(self):
+        from cleaning import _SORT_KEY
+        df = pd.DataFrame({'timestamp': ['2026-09-12T00:00:00+00:00'], 'v': [1.0]})
+        out = clean_and_impute(df, 'v', time_col='timestamp', min_val=0.0, max_val=10.0)
+        self.assertNotIn(_SORT_KEY, out.columns)
+
+
+class TestFIRMSPointEventSemantics(unittest.TestCase):
+    """
+    BUG: the first audit fixed the GFS instance of "quality control treating
+    unrelated rows as a time series" but missed the FIRMS instance. Consecutive
+    FIRMS rows are SEPARATE FIRES, so a flatline check flags any twelve fires
+    that share a rounded brightness as a stuck sensor.
+    """
+
+    def _separate_fires(self, n=14, brightness=300.0):
+        return pd.DataFrame({
+            'sensor': ['MODIS_NRT'] * n,
+            'lat': [20.0 + i * 0.5 for i in range(n)],
+            'lon': [78.0 + i * 0.5 for i in range(n)],
+            'timestamp': [f'2026-09-12T{i:02d}:00:00+00:00' for i in range(n)],
+            'brightness_k_raw': [brightness] * n,
+        })
+
+    def test_distinct_fires_are_not_flagged_as_a_flatline(self):
+        out = clean_and_impute(
+            self._separate_fires(), 'brightness_k_raw', time_col='timestamp',
+            group_cols=['sensor'], min_val=200.0, max_val=600.0,
+            max_step_change=None, window_flatline=None,
+        )
+        self.assertEqual(set(out['brightness_k_raw_qc_flag']), {'ok'},
+                         "separate fires are being flagged as a stuck sensor")
+
+    def test_the_flatline_check_would_still_fire_if_left_enabled(self):
+        """Confirms the failure mode is real, not hypothetical."""
+        out = clean_and_impute(
+            self._separate_fires(), 'brightness_k_raw', time_col='timestamp',
+            group_cols=['sensor'], min_val=200.0, max_val=600.0,
+            max_step_change=None, window_flatline=12,
+        )
+        self.assertIn('flatline', set(out['brightness_k_raw_qc_flag']))
+
+    def test_range_check_still_applies_to_fires(self):
+        """Disabling the time-series checks must not disable range checking."""
+        df = self._separate_fires(n=2)
+        df.loc[0, 'brightness_k_raw'] = 900.0      # physically impossible
+        out = clean_and_impute(
+            df, 'brightness_k_raw', time_col='timestamp', group_cols=['sensor'],
+            min_val=200.0, max_val=600.0, max_step_change=None, window_flatline=None,
+        )
+        self.assertIn('range_fail', out['brightness_k_raw_qc_flag'].iloc[0])
+
+    def test_fetcher_passes_point_event_settings(self):
+        import inspect
+        import fetch_firms
+        source = inspect.getsource(fetch_firms.main)
+        self.assertIn('window_flatline=None', source)
+        self.assertIn('max_step_change=None', source)
+
+
+class TestGoldLayerRobustness(unittest.TestCase):
+
+    def test_dominant_pollutant_survives_a_row_with_no_subindices(self):
+        """
+        BUG: DataFrame.idxmax raises "Encountered all NA values" on an all-NA
+        row. A WAQI station returning an empty iaqi block therefore crashed the
+        entire gold rebuild, for every city.
+        """
+        cols = ['pm25_aqi_clean', 'pm10_aqi_clean']
+        df = pd.DataFrame({cols[0]: [np.nan, 100.0], cols[1]: [np.nan, 50.0]})
+        with self.assertRaises(ValueError):
+            df.idxmax(axis=1)          # the raw operation still raises
+
+        has_any = df[cols].notna().any(axis=1)
+        dominant = pd.Series(pd.NA, index=df.index, dtype=object)
+        dominant[has_any] = df.loc[has_any, cols].idxmax(axis=1).str.replace(
+            '_aqi_clean', '', regex=False)
+        self.assertTrue(pd.isna(dominant.iloc[0]))
+        self.assertEqual(dominant.iloc[1], 'pm25')
+
+    def test_gfs_lookback_is_measured_in_days_not_files(self):
+        """
+        BUG: GFS partitions are cycles, four per day, but the slice used
+        lookback_days directly — so a 3-day lookback kept 18 hours of data.
+        """
+        from gold_layer import CYCLES_PER_DAY
+        self.assertEqual(CYCLES_PER_DAY, 4)
+        import inspect, gold_layer
+        self.assertIn('lookback_days * CYCLES_PER_DAY',
+                      inspect.getsource(gold_layer._recent_partitions))
+
+
+class TestSQLPlaceholderRewrite(unittest.TestCase):
+    """
+    BUG: execute_query rewrote Postgres %s placeholders for SQLite with a blind
+    str.replace, which also mangled any %s appearing inside a string literal —
+    the LIKE pattern '%send%' became '?end%'.
+    """
+
+    def test_placeholders_outside_literals_are_rewritten(self):
+        from db import _to_sqlite
+        self.assertEqual(_to_sqlite("SELECT * FROM t WHERE a = %s AND b = %s"),
+                         "SELECT * FROM t WHERE a = ? AND b = ?")
+
+    def test_percent_s_inside_a_string_literal_is_left_alone(self):
+        from db import _to_sqlite
+        out = _to_sqlite("SELECT * FROM t WHERE src LIKE %s AND note LIKE '%send%'")
+        self.assertEqual(out, "SELECT * FROM t WHERE src LIKE ? AND note LIKE '%send%'")
+        self.assertNotIn("'?end%'", out)
+
+    def test_conflict_clause_still_translated(self):
+        from db import _to_sqlite
+        out = _to_sqlite("INSERT INTO t (a) VALUES (%s) ON CONFLICT DO NOTHING")
+        self.assertEqual(out, "INSERT OR IGNORE INTO t (a) VALUES (?)")
+
+
+class TestContractSchemaFailures(unittest.TestCase):
+    """
+    BUG: a missing column produced failure rows with no index, so no row was
+    dropped and the event was logged at the same volume as one bad reading.
+    A source that stops returning a pollutant is a much bigger event.
+    """
+
+    def test_missing_columns_are_logged_as_schema_violations(self):
+        from contracts import validate, HAS_PANDERA
+        if not HAS_PANDERA:
+            self.skipTest("pandera not installed")
+        df = pd.DataFrame({'station_id': ['1'], 'city': ['delhi'],
+                           'timestamp': ['2026-09-12T00:00:00+00:00'],
+                           'source': ['waqi'], 'is_synthetic': [0]})
+        with self.assertLogs('contracts', level='ERROR') as captured:
+            out, failures = validate(df, 'waqi')
+        self.assertTrue(any('SCHEMA VIOLATION' in line for line in captured.output),
+                        "a missing column is not reported as a schema-level violation")
+        # Rows are still written: the data present is valid, the column is absent.
+        self.assertEqual(len(out), len(df))
+        self.assertFalse(failures.empty)
+
+
+class TestDependencyPins(unittest.TestCase):
+    """
+    BUG: requirements pinned pyarrow~=21.0 while the code was developed and
+    tested against 25.0.1, so a fresh install silently ran a different version
+    from the one that was verified — the exact reproducibility problem the
+    pinning was meant to solve.
+    """
+
+    def test_no_pin_excludes_the_installed_version(self):
+        import importlib.metadata as md
+        import re as _re
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'requirements.txt')
+        with open(path, encoding='utf-8') as fh:
+            lines = [ln.split('#')[0].strip() for ln in fh if ln.strip()
+                     and not ln.strip().startswith('#')]
+
+        for line in lines:
+            m = _re.match(r'^([A-Za-z0-9_.\-]+)\s*~=\s*([0-9.]+)$', line)
+            if not m:
+                continue
+            name, pin = m.group(1), m.group(2)
+            try:
+                installed = md.version(name)
+            except md.PackageNotFoundError:
+                continue
+            pin_major = pin.split('.')[0]
+            got_major = installed.split('.')[0]
+            self.assertEqual(
+                pin_major, got_major,
+                f"{name} is pinned ~={pin} but {installed} is installed: a fresh "
+                f"install would not reproduce what was tested")

@@ -55,6 +55,9 @@ MIN_HOURS_FOR_DAILY_AQI = int(os.getenv('MIN_HOURS_FOR_DAILY_AQI', '16'))
 
 POLLUTANTS = ['pm25', 'pm10', 'no2', 'so2', 'co', 'o3']
 
+# NOAA runs GFS at 00, 06, 12 and 18 UTC.
+CYCLES_PER_DAY = 4
+
 
 # BUGFIX: duckdb was imported at module scope, so a missing or broken duckdb
 # wheel took down scheduler.py at import time (it imports build_all_gold) and
@@ -77,7 +80,10 @@ def _recent_partitions(source, lookback_days, key='date'):
 
     files = sorted(glob.glob(os.path.join(directory, f'{key}=*.parquet')))
     if key != 'date':
-        return directory, files[-lookback_days:] if lookback_days else files
+        # GFS partitions are cycles, not dates, and there are four per day.
+        # Slicing by lookback_days directly would keep 3 cycles (18 hours),
+        # not 3 days.
+        return directory, files[-(lookback_days * CYCLES_PER_DAY):] if lookback_days else files
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
     recent = [f for f in files if os.path.basename(f)[len('date='):-len('.parquet')] >= cutoff]
@@ -135,8 +141,16 @@ def build_city_aqi_hourly():
     # WAQI is the US EPA scale; labelling it with CPCB band names would
     # mis-state the health advice for anything between 101 and 200.
     df['aqi_category'] = df['aqi'].apply(lambda v: categorise(v, 'us_epa'))
-    df['dominant_pollutant'] = df[subindex_cols].idxmax(axis=1).str.replace(
-        '_aqi_clean', '', regex=False)
+    # BUGFIX: DataFrame.idxmax raises "Encountered all NA values" when a row has
+    # no sub-index at all, which happens whenever a WAQI station returns an empty
+    # iaqi block. That crashed the whole gold rebuild for every city.
+    has_any = df[subindex_cols].notna().any(axis=1)
+    df['dominant_pollutant'] = pd.NA
+    if has_any.any():
+        df.loc[has_any, 'dominant_pollutant'] = (
+            df.loc[has_any, subindex_cols].idxmax(axis=1)
+            .str.replace('_aqi_clean', '', regex=False)
+        )
 
     agg = {f'{p}_aqi_mean': (f'{p}_aqi_clean', 'mean')
            for p in POLLUTANTS if f'{p}_aqi_clean' in df.columns}

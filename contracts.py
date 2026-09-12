@@ -175,6 +175,22 @@ def validate(df, source):
         valid_df = df.drop(index=bad_indices)
 
         log_path = _write_failures(failures, source)
+
+        # A failure with no row index is a SCHEMA-level problem — most often a
+        # required column missing from the frame entirely. Those dropped no rows,
+        # so without this they were logged at the same volume as a single bad
+        # reading and every row was written anyway. A source that silently stops
+        # returning a pollutant is a much bigger event than one bad value.
+        schema_level = failures[failures['index'].isna()]
+        if not schema_level.empty:
+            names = sorted({str(c) for c in schema_level['failure_case'].dropna().unique()})
+            logger.error(
+                f"[contracts] SCHEMA VIOLATION — source={source!r}: "
+                f"{len(schema_level)} structural failure(s) affecting no specific row "
+                f"(usually a missing column): {', '.join(names[:10])}. "
+                f"Every row was still written; inspect {log_path}"
+            )
+
         logger.error(
             f"[contracts] CONTRACT VIOLATION — source={source!r}: {len(failures)} check "
             f"failure(s), {len(bad_indices)} row(s) dropped. Details: {log_path}"

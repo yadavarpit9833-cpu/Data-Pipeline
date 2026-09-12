@@ -148,19 +148,29 @@ def parse_grib2(path):
     cfgrib (ecCodes) handles packing templates, bitmaps and scanning modes.
     Doing this by hand is what produced wrong values before.
     """
+    # cfgrib imports fine on its own but only exposes open_datasets once xarray
+    # is importable, so guarding `import cfgrib` alone let a missing xarray
+    # surface as a bare AttributeError from inside the parse loop — where
+    # fetch_cycle swallowed it per forecast hour and reported an unhelpful
+    # "no forecast hours retrieved".
     try:
+        import xarray  # noqa: F401  (required for cfgrib.open_datasets)
         import cfgrib
-    except ImportError as e:
+        open_datasets = cfgrib.open_datasets
+    except (ImportError, AttributeError) as e:
         raise RuntimeError(
-            "cfgrib is required to decode GFS GRIB2 files but is not importable. "
-            "Install the ecCodes system library and the Python bindings:\n"
-            "  Debian/Ubuntu : sudo apt-get install -y libeccodes0 && pip install cfgrib\n"
+            "Cannot decode GFS GRIB2 files: cfgrib/xarray are not usable "
+            f"({type(e).__name__}: {e}).\n"
+            "  pip install cfgrib xarray\n"
+            "Recent cfgrib wheels bundle the ecCodes library, so no system package "
+            "is normally needed. If the import still fails, install ecCodes too:\n"
+            "  Debian/Ubuntu : sudo apt-get install -y libeccodes0 libeccodes-data\n"
             "  conda         : conda install -c conda-forge cfgrib eccodes\n"
             "The pipeline refuses to guess at GRIB2 packing rather than store wrong numbers."
         ) from e
 
     # indexpath='' stops cfgrib writing .idx files next to a temp file.
-    datasets = cfgrib.open_datasets(path, backend_kwargs={'indexpath': ''})
+    datasets = open_datasets(path, backend_kwargs={'indexpath': ''})
 
     merged = None
     for ds in datasets:

@@ -80,8 +80,11 @@ boundary. Asking for a cycle sooner than that returns an HTML error page with
 HTTP 200, not GRIB. The old code hardcoded the 00z cycle and ran at 00:30 UTC,
 which was always too early.
 
-**GRIB2 decoding needs ecCodes.** `cfgrib` wraps ECMWF's ecCodes C library,
-which must be installed at system level:
+**GRIB2 decoding needs ecCodes and xarray.** `cfgrib` wraps ECMWF's ecCodes C
+library. Current `eccodes` wheels (2.41+) ship that library inside the wheel via
+`eccodeslib`, so `pip install -r requirements.txt` is normally sufficient — this
+was verified on a container with no system `libeccodes` present. Only if pip has
+no wheel for your platform do you need the system package:
 
 ```bash
 sudo apt-get install -y libeccodes0 libeccodes-data   # Debian/Ubuntu
@@ -89,8 +92,9 @@ brew install eccodes                                  # macOS
 conda install -c conda-forge eccodes                  # conda
 ```
 
-The Docker image installs it already. Without ecCodes, `fetch_gfs` raises a
-clear error. It does **not** fall back to synthetic data — the previous version
+Note that `xarray` is required too: `cfgrib` imports without it but only exposes
+`open_datasets` once xarray is importable. Without ecCodes or xarray,
+`fetch_gfs` raises a clear, actionable error. It does **not** fall back to synthetic data — the previous version
 wrote a hardcoded 25 °C grid on any failure, and because of the
 `INSERT OR IGNORE` on `UNIQUE(lat, lon, cycle, fhr)` those fake rows then
 blocked the real data for the rest of the day.

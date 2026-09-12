@@ -3,9 +3,11 @@
 # matters when the demo machine is not the development machine.
 FROM python:3.12-slim
 
-# ecCodes is the system library behind cfgrib. Without it fetch_gfs cannot
-# decode NOAA GRIB2 files — and it will say so loudly rather than fabricate
-# a grid, which is what the previous version did.
+# Current eccodes wheels bundle the native library, so this is belt-and-braces
+# rather than strictly required: it guarantees GRIB2 decoding still works on a
+# platform where pip falls back to a source build. fetch_gfs raises a clear
+# error if ecCodes is unavailable rather than fabricating a grid, which is what
+# the previous version did.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libeccodes0 \
         libeccodes-data \

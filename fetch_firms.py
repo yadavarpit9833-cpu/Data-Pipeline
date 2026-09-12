@@ -247,9 +247,18 @@ def main():
     # QC only. No lat_col/lon_col: spatial KNN on point-source fire events
     # fabricates brightness values, which is how VIIRS rows silently acquired
     # MODIS temperatures from thousands of kilometres away.
+    # Range check only.
+    #
+    # max_step_change=None and window_flatline=None are both deliberate, and for
+    # the same reason the GFS quality control had to be regrouped: consecutive
+    # rows here are SEPARATE FIRES, not consecutive readings from one instrument.
+    # A step check would compare the brightness of one fire against an unrelated
+    # fire, and a flatline check flags any twelve fires that happen to share a
+    # rounded brightness temperature as a stuck sensor. Neither is meaningful
+    # for point events.
     combined = clean_and_impute(
         combined, 'brightness_k_raw', time_col='timestamp', group_cols=['sensor'],
-        min_val=200.0, max_val=600.0, max_step_change=None,
+        min_val=200.0, max_val=600.0, max_step_change=None, window_flatline=None,
     )
     combined.rename(columns={
         'brightness_k_raw_clean': 'brightness_k_clean',

@@ -65,13 +65,15 @@ docker compose up --build
 ### Locally
 
 ```bash
-# ecCodes is a SYSTEM library; cfgrib cannot decode GFS GRIB2 without it
-sudo apt-get install -y libeccodes0 libeccodes-data   # Debian/Ubuntu
-# brew install eccodes                                # macOS
-# conda install -c conda-forge eccodes                # conda
-
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# GFS GRIB2 decoding needs ecCodes. Current eccodes wheels bundle it, so the
+# pip install above is usually all you need. Only if `python -c "import cfgrib"`
+# fails do you also need the system package:
+#   sudo apt-get install -y libeccodes0 libeccodes-data   # Debian/Ubuntu
+#   brew install eccodes                                  # macOS
+#   conda install -c conda-forge eccodes                  # conda
 
 cp .env.example .env     # fill in the two API keys
 python db.py             # create the schema
@@ -168,9 +170,9 @@ worth knowing:
 python -m unittest discover -s . -p "test_*.py" -v
 ```
 
-`test_cleaning.py` covers the QC chain, `test_aqi.py` the index maths,
-`test_pipeline_fixes.py` is a regression suite pinning each data-correctness
-bug that was found and fixed, and `test_idempotency.py` proves that reruns do
+`test_cleaning.py` covers the QC chain, `test_aqi.py` the index maths, and
+`test_pipeline_fixes.py` is a regression suite pinning every data-correctness
+bug found in the audits — including schema idempotency, so reruns provably do
 not duplicate rows.
 
 CI runs all of it on every push — see `.github/workflows/ci.yml`.

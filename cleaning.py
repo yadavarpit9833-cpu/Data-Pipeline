@@ -7,6 +7,46 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
+_SORT_KEY = '__qc_sort_key__'
+
+
+def _with_sort_key(df, time_col):
+    """
+    Returns (frame, sort_column) with a real datetime sort key.
+
+    BUGFIX: the QC checks used to sort by the raw timestamp STRING. ISO strings
+    only sort correctly when every value carries the same UTC offset, and this
+    pipeline mixes them routinely: WAQI reports '...+05:30' while the fallback
+    timestamp and every other source use '...+00:00'. Under a string sort
+    '2026-09-12T23:30:00+05:30' (18:00 UTC) sorts AFTER
+    '2026-09-12T20:00:00+00:00' (20:00 UTC), so step and flatline checks
+    compared readings in the wrong temporal order and produced wrong flags.
+    """
+    if not time_col or time_col not in df.columns:
+        return df, None
+    out = df.copy()
+    parsed = pd.to_datetime(out[time_col], utc=True, errors='coerce', format='mixed')
+    # Rows whose timestamp will not parse keep their original ordering rather
+    # than being silently shuffled to one end of the frame.
+    if parsed.isna().all():
+        return out, time_col
+    out[_SORT_KEY] = parsed
+    return out, _SORT_KEY
+
+
+def _sort_for_qc(df, group_cols, time_col):
+    """Sorts by group then true chronological order, returning the sorted frame."""
+    frame, sort_col = _with_sort_key(df, time_col)
+    sort_cols = []
+    if group_cols:
+        sort_cols.extend(group_cols if isinstance(group_cols, list) else [group_cols])
+    if sort_col:
+        sort_cols.append(sort_col)
+    if sort_cols:
+        frame = frame.sort_values(by=sort_cols, kind='stable')
+    return frame
+
+
 def check_range(df, value_col, min_val=0.0, max_val=1000.0):
     """
     Flags readings outside parameter-specific physical bounds (range_fail).
@@ -30,20 +70,11 @@ def check_step(df, value_col, group_cols=None, time_col=None, max_step_change=30
     if max_step_change is None or max_step_change <= 0:
         return pd.Series(False, index=df.index)
         
-    df_sorted = df.copy()
-    original_index = df_sorted.index
-    
-    sort_cols = []
-    if group_cols:
-        sort_cols.extend(group_cols if isinstance(group_cols, list) else [group_cols])
-    if time_col and time_col in df_sorted.columns:
-        sort_cols.append(time_col)
-        
-    if sort_cols:
-        df_sorted = df_sorted.sort_values(by=sort_cols)
-        
+    original_index = df.index
+    df_sorted = _sort_for_qc(df, group_cols, time_col)
+
     s = df_sorted[value_col]
-    
+
     if group_cols:
         s_prev = df_sorted.groupby(group_cols)[value_col].shift(1)
     else:
@@ -69,20 +100,11 @@ def check_flatline(df, value_col, group_cols=None, time_col=None, window=12, ign
     if window is None or window <= 1:
         return pd.Series(False, index=df.index)
         
-    df_sorted = df.copy()
-    original_index = df_sorted.index
-    
-    sort_cols = []
-    if group_cols:
-        sort_cols.extend(group_cols if isinstance(group_cols, list) else [group_cols])
-    if time_col and time_col in df_sorted.columns:
-        sort_cols.append(time_col)
-        
-    if sort_cols:
-        df_sorted = df_sorted.sort_values(by=sort_cols)
-        
+    original_index = df.index
+    df_sorted = _sort_for_qc(df, group_cols, time_col)
+
     s = df_sorted[value_col]
-    
+
     # Run-length identification
     is_diff = (s != s.shift(1)) | s.isna()
     if group_cols:
@@ -223,7 +245,10 @@ def clean_and_impute(df, value_col, time_col=None, lat_col=None, lon_col=None, g
     # 3. Imputation strictly on originally missing (NaN) values
     if originally_missing.any():
         if time_col and time_col in df.columns:
-            df = df.sort_values(by=time_col)
+            # Sort chronologically, not lexicographically: linear interpolation
+            # between neighbours is only meaningful if the neighbours really
+            # are adjacent in time. See _with_sort_key.
+            df = _sort_for_qc(df, None, time_col)
             if group_cols:
                 df[f'{value_col}_clean'] = df.groupby(group_cols)[f'{value_col}_clean'].transform(
                     lambda x: x.interpolate(method='linear', limit=3)
@@ -235,5 +260,6 @@ def clean_and_impute(df, value_col, time_col=None, lat_col=None, lon_col=None, g
             df = impute_spatial_knn(df, value_col, lat_col, lon_col)
 
     df[f'{value_col}_imputed'] = originally_missing & df[f'{value_col}_clean'].notna()
-    return df
+    # The sort key is an internal artefact; it must not reach Parquet or the DB.
+    return df.drop(columns=[_SORT_KEY], errors='ignore')
 

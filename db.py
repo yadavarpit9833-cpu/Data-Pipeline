@@ -40,6 +40,22 @@ SQLITE_BUSY_TIMEOUT_S = float(os.getenv('SQLITE_BUSY_TIMEOUT_S', '30'))
 _SCHEMA_APPLIED = False
 
 
+# A %s placeholder is only a placeholder when it is not inside a string literal.
+# A blind str.replace turned the LIKE pattern '%send%' into '?end%'.
+_PLACEHOLDER_RE = re.compile(r"'[^']*'|%s")
+
+
+def _to_sqlite(query):
+    """Rewrites a Postgres-style query for SQLite, leaving string literals alone."""
+    query = _PLACEHOLDER_RE.sub(
+        lambda m: '?' if m.group(0) == '%s' else m.group(0), query)
+    if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
+        query = (query
+                 .replace('INSERT INTO', 'INSERT OR IGNORE INTO')
+                 .replace(' ON CONFLICT DO NOTHING', ''))
+    return query
+
+
 def get_db_connection():
     """
     Returns a database connection. Defaults to SQLite for local prototyping.
@@ -79,11 +95,7 @@ def execute_query(cursor, query, params=()):
             if 'ON CONFLICT' not in query:
                 query = query + ' ON CONFLICT DO NOTHING'
     else:
-        query = query.replace('%s', '?')
-        if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
-            query = (query
-                     .replace('INSERT INTO', 'INSERT OR IGNORE INTO')
-                     .replace(' ON CONFLICT DO NOTHING', ''))
+        query = _to_sqlite(query)
 
     cursor.execute(query, params)
 
@@ -98,11 +110,7 @@ def execute_many(cursor, query, rows):
             if 'ON CONFLICT' not in query:
                 query = query + ' ON CONFLICT DO NOTHING'
     else:
-        query = query.replace('%s', '?')
-        if 'ON CONFLICT DO NOTHING' in query and 'INSERT OR IGNORE' not in query:
-            query = (query
-                     .replace('INSERT INTO', 'INSERT OR IGNORE INTO')
-                     .replace(' ON CONFLICT DO NOTHING', ''))
+        query = _to_sqlite(query)
     cursor.executemany(query, rows)
 
 
