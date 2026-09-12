@@ -194,6 +194,43 @@ docs/              data source, unit and licence reference
 
 ---
 
+## Do not keep this repo in OneDrive (or Dropbox, or Google Drive)
+
+A sync client opens and locks files while they are being written. For this
+pipeline that means three separate failures:
+
+| Symptom | Cause |
+|---|---|
+| `database is locked` | OneDrive holds `env_data.db` open mid-transaction |
+| `PermissionError` on write | the atomic Parquet rename lands on a locked file |
+| Database corruption | `env_data.db-wal` and `-shm` are synced **separately** from `env_data.db` |
+
+The third one is the serious one, and it got **worse** when WAL mode was
+enabled to fix the locking. SQLite's write-ahead log only works while the
+`-wal` and `-shm` sidecars stay consistent with the main database file. A sync
+client uploads all three independently and can restore them from different
+points in time, turning a recoverable lock into an unrecoverable database.
+
+On Windows, from the repo root:
+
+```powershell
+# See what it would do
+powershell -ExecutionPolicy Bypass -File scripts\move_out_of_onedrive.ps1
+
+# Do it: moves to C:\DataPipeline and re-registers the scheduled tasks
+powershell -ExecutionPolicy Bypass -File scripts\move_out_of_onedrive.ps1 -Force
+```
+
+If you must keep the code in a synced folder, at least move the data out —
+both paths are environment driven:
+
+```
+SQLITE_DB_PATH=C:/DataPipeline/env_data.db
+DATA_DIR=C:/DataPipeline/data
+```
+
+---
+
 ## Known limitations
 
 Stated plainly, because a pipeline that hides these is worse than one that

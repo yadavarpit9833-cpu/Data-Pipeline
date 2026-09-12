@@ -14,4 +14,5 @@ contains only modules the pipeline actually imports.
 | `inspect_firms.py` | FIRMS payload and duplicate inspection. |
 | `test_duckdb.py` | Scratch DuckDB check. Not part of the test suite despite the name. |
 | `normalize_gfs_cycles.py` | Historical one-off: repaired `cycle='00'` rows. Contains a hardcoded date and is kept only for provenance. |
-| `setup_*.ps1`, `check_task_alive.ps1`, `capture_task_deletion_evidence.ps1` | Windows Task Scheduler deployment. Superseded by the Dockerfile for anything portable. |
+| `move_out_of_onedrive.ps1` | **Run this first on Windows if the repo sits in OneDrive.** Dry-run by default; `-Force` performs the move and re-registers the scheduled tasks. |
+| `setup_*.ps1`, `check_task_alive.ps1`, `capture_task_deletion_evidence.ps1` | Windows Task Scheduler deployment. Paths resolve from `$PSScriptRoot`, so they follow the checkout. Superseded by the Dockerfile for anything portable. |
