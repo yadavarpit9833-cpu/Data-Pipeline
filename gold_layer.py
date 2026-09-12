@@ -16,13 +16,19 @@ import os
 import logging
 import pandas as pd
 import numpy as np
-import duckdb
 from datetime import datetime, timezone
 from storage import DATA_DIR, ensure_dir
 
 logger = logging.getLogger('gold_layer')
 
 GOLD_DIR = os.path.join(DATA_DIR, 'gold')
+
+# BUGFIX: duckdb was imported at module scope, so a missing/broken duckdb wheel
+# took down scheduler.py at import time (it imports build_all_gold) and therefore
+# killed CPCB, weather, GFS and FIRMS too. Import it lazily instead.
+def _duckdb():
+    import duckdb
+    return duckdb
 
 
 # ── AQI sub-index formulas (India CPCB standard) ─────────────────────────────
@@ -89,7 +95,7 @@ def build_city_aqi_hourly():
         logger.warning("[gold] No cleaned_cpcb Parquet files found. Skipping city_aqi_hourly.")
         return 0
 
-    conn = duckdb.connect()
+    conn = _duckdb().connect()
     df = conn.execute(f"SELECT * FROM '{cleaned_dir}/*.parquet'").fetchdf()
     conn.close()
 
@@ -151,7 +157,7 @@ def build_gfs_grid_hourly():
         logger.warning("[gold] No cleaned_gfs Parquet files found. Skipping gfs_grid_hourly.")
         return 0
 
-    conn = duckdb.connect()
+    conn = _duckdb().connect()
     df = conn.execute(f"SELECT * FROM '{cleaned_dir}/*.parquet'").fetchdf()
     conn.close()
 
@@ -199,7 +205,7 @@ def build_city_daily_summary():
     cpcb_dir    = os.path.join(DATA_DIR, 'cleaned_cpcb')
     weather_dir = os.path.join(DATA_DIR, 'cleaned_weather')
 
-    conn = duckdb.connect()
+    conn = _duckdb().connect()
 
     if not os.path.exists(cpcb_dir) or not os.listdir(cpcb_dir):
         logger.warning("[gold] No cleaned_cpcb data for daily summary. Skipping.")

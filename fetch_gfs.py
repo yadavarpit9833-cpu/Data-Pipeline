@@ -51,11 +51,22 @@ def parse_grib2_subregion(content):
     pos = 0
     records = {}
     
-    while pos < len(content):
-        if content[pos:pos+4] == b'GRIB':
-            length = int.from_bytes(content[pos+8:pos+16], 'big')
-            msg = content[pos:pos+length]
-            pos += length
+    while pos < len(content) - 4:
+        if content[pos:pos+4] != b'GRIB':
+            # BUGFIX: without this the loop never advances on non-GRIB payloads
+            # (NOMADS returns an HTML error page when a cycle is not yet published,
+            # or when the IP is rate-limited) and the process spins forever at 100% CPU.
+            pos += 1
+            continue
+
+        length = int.from_bytes(content[pos+8:pos+16], 'big')
+        if length <= 0 or pos + length > len(content):
+            # Truncated or malformed message: skip past this header, never stall.
+            pos += 4
+            continue
+        msg = content[pos:pos+length]
+        pos += length
+        if True:
             
             sec_pos = 16
             sec3, sec4, sec5, sec7 = None, None, None, None
@@ -88,10 +99,20 @@ def parse_grib2_subregion(content):
             dec_scale = int.from_bytes(sec5[17:19], 'big', signed=True)
             nbits = sec5[19]
             
-            raw_bytes = sec7[5:]
-            bit_str = ''.join(f'{b:08b}' for b in raw_bytes)
-            packed_ints = [int(bit_str[i:i+nbits], 2) for i in range(0, nbits * ni * nj, nbits)]
-            values = [(ref_val + p * (2 ** bin_scale)) * (10 ** (-dec_scale)) for p in packed_ints]
+            npoints = ni * nj
+            if nbits == 0:
+                # BUGFIX: a constant GRIB field (e.g. APCP that is zero everywhere)
+                # is packed with nbits=0. range(0, 0, 0) raises ValueError, which was
+                # swallowed by main() and silently replaced real data with the
+                # hardcoded 25 deg C fallback grid.
+                values = [ref_val * (10 ** (-dec_scale))] * npoints
+            else:
+                raw_bytes = sec7[5:]
+                if len(raw_bytes) * 8 < nbits * npoints:
+                    continue  # truncated data section
+                bit_str = ''.join(f'{b:08b}' for b in raw_bytes)
+                packed_ints = [int(bit_str[i:i+nbits], 2) for i in range(0, nbits * npoints, nbits)]
+                values = [(ref_val + p * (2 ** bin_scale)) * (10 ** (-dec_scale)) for p in packed_ints]
             
             var_name = 'unknown'
             if cat == 0 and param == 0: var_name = 'temperature_raw'
@@ -135,7 +156,13 @@ def fetch_noaa_nomads_gfs():
     logger.info("Fetching official NOAA GFS 0.25° subregion dataset from NOMADS...")
     r = requests.get(url, timeout=25)
     r.raise_for_status()
-    
+
+    # BUGFIX: NOMADS answers with HTTP 200 + an HTML error page when the cycle is
+    # not published yet or the IP is throttled. Reject it before parsing.
+    if not r.content.startswith(b'GRIB'):
+        head = r.content[:200].decode('utf-8', 'replace').strip()
+        raise ValueError(f"NOMADS did not return GRIB2 for cycle {cycle} f{fhr}: {head!r}")
+
     parsed = parse_grib2_subregion(r.content)
     if 'temperature_raw' not in parsed:
         raise ValueError("Failed to parse temperature_raw from NOAA GRIB2 response")

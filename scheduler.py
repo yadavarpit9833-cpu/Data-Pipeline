@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 from datetime import datetime, timezone
@@ -14,13 +15,22 @@ from fetch_firms import main as fetch_firms
 from fetch_sentinel5p import main as fetch_sentinel5p
 from gold_layer import build_all_gold
 
+# BUGFIX: Windows consoles default to cp1252/cp437, which cannot encode the
+# em-dashes and degree signs in our log messages. logging swallows the
+# UnicodeEncodeError and drops the line, so runs looked silently truncated.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # Setup logging
 log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file_path, encoding='utf-8-sig'),
+        logging.FileHandler(log_file_path, encoding='utf-8'),
         logging.StreamHandler()
     ],
     force=True
