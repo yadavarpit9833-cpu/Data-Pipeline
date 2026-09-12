@@ -904,33 +904,61 @@ class TestFIRMSBackfillPlanning(unittest.TestCase):
             self.assertEqual(sorted(covered), expected, f"{year}-{month:02d}")
             self.assertEqual(len(covered), len(set(covered)), "a day is fetched twice")
 
+    def test_day_range_limit_matches_the_server_not_the_docs(self):
+        """
+        BUG: MAX_DAY_RANGE was 10, taken from NASA's own API page. The live
+        server rejects anything above 5 with
+            HTTP 400  "Invalid day range. Expects [1..5]."
+        which made every single archive request fail.
+        """
+        self.assertEqual(self.max_day_range, 5)
+
     def test_requested_window_costs_what_we_claim(self):
-        """Jan/Oct/Nov/Dec 2020-2025 across three sensors."""
+        """Jan/Oct/Nov/Dec 2020-2025 across three sensors, at 5 days a chunk."""
         plan, _ = self.build_plan(
             range(2020, 2026), [1, 10, 11, 12],
             ['MODIS_SP', 'VIIRS_SNPP_SP', 'VIIRS_NOAA20_SP'],
-            today=date(2026, 9, 12))
-        self.assertEqual(len(plan), 270)
+            today=date(2026, 9, 13))
+        self.assertEqual(len(plan), 486)
         self.assertLess(len(plan), 5000, "would exceed the MAP_KEY 10-minute budget")
 
-    def test_dates_before_an_instrument_existed_are_not_requested(self):
-        """VIIRS S-NPP launched in 2012; asking it for 2005 wastes a call."""
+    def test_dates_before_a_sources_coverage_are_not_requested(self):
+        """VIIRS S-NPP SP starts 2012-01-20; asking it for 2005 wastes a call."""
         plan, skipped = self.build_plan(
-            [2005], [1], ['VIIRS_SNPP_SP'], today=date(2026, 9, 12))
+            [2005], [1], ['VIIRS_SNPP_SP'], today=date(2026, 9, 13))
         self.assertEqual(plan, [])
         self.assertTrue(skipped)
-        self.assertIn('first light', skipped[0][2])
+        self.assertIn('coverage starts', skipped[0][2])
+
+    def test_dates_after_a_sources_coverage_are_not_requested(self):
+        """
+        FIRMS reports MODIS_SP ending 2026-05-31 — the archive lags the present
+        by months. Requesting past it returns an empty CSV, not an error, so
+        without this the run would look successful and store nothing.
+        """
+        plan, skipped = self.build_plan(
+            [2026], [8], ['MODIS_SP'], today=date(2026, 9, 13))
+        self.assertEqual(plan, [])
+        self.assertTrue(any('coverage ends' in s[2] for s in skipped))
+
+    def test_live_availability_overrides_the_builtin_dates(self):
+        """The endpoint is authoritative; the constants are only a fallback."""
+        narrow = {'MODIS_SP': (date(2023, 1, 1), date(2023, 12, 31))}
+        plan, _ = self.build_plan([2020, 2023], [1], ['MODIS_SP'],
+                                  today=date(2026, 9, 13), availability=narrow)
+        self.assertTrue(plan)
+        self.assertTrue(all(p[1].startswith('2023') for p in plan))
 
     def test_future_dates_are_not_requested(self):
         plan, skipped = self.build_plan(
-            [2030], [1], ['MODIS_SP'], today=date(2026, 9, 12))
+            [2030], [1], ['MODIS_SP'], today=date(2026, 9, 13), availability={})
         self.assertEqual(plan, [])
         self.assertTrue(any('future' in s[2] for s in skipped))
 
     def test_modis_is_available_for_the_whole_requested_range(self):
         plan, _ = self.build_plan(range(2020, 2026), [1, 10, 11, 12],
-                                  ['MODIS_SP'], today=date(2026, 9, 12))
-        self.assertEqual(len(plan), 90)
+                                  ['MODIS_SP'], today=date(2026, 9, 13))
+        self.assertEqual(len(plan), 162)
 
 
 class TestFIRMSBackfillUpsert(unittest.TestCase):

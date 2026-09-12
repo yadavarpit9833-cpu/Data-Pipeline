@@ -12,9 +12,12 @@ sources, which are the reprocessed archive.
     https://firms.modaps.eosdis.nasa.gov/api/area/csv/
         {MAP_KEY}/{SOURCE}/{west,south,east,north}/{DAY_RANGE}/{START_DATE}
 
-    DAY_RANGE  : 1..10          START_DATE : YYYY-MM-DD, returns
+    DAY_RANGE  : 1..5           START_DATE : YYYY-MM-DD, returns
     MAP_KEY    : 5000 requests               START_DATE .. START_DATE+DAY_RANGE-1
                  per 10 minutes
+
+NASA's API page documents DAY_RANGE as 1..10. The server rejects anything above
+5 with "Invalid day range. Expects [1..5]." The server wins.
 
 NRT vs SP matters for correctness, not just coverage. SP is the reprocessed
 version of the same detections, so the same fire appears in both streams. The
@@ -73,7 +76,10 @@ load_dotenv()
 FIRMS_MAP_KEY = os.getenv('FIRMS_MAP_KEY')
 
 API_BASE = 'https://firms.modaps.eosdis.nasa.gov/api'
-MAX_DAY_RANGE = 10          # hard API limit
+# The API enforces 1..5, NOT the 1..10 that NASA's own API page documents.
+# Asking for 10 returns: HTTP 400 "Invalid day range. Expects [1..5]."
+# Confirmed against the live endpoint on 2026-09-13.
+MAX_DAY_RANGE = 5
 DEFAULT_MONTHS = [1, 10, 11, 12]
 DEFAULT_YEARS = list(range(2020, 2026))
 
@@ -86,13 +92,14 @@ NRT_FALLBACK = {
     'VIIRS_NOAA20_SP': 'VIIRS_NOAA20_NRT',
 }
 
-# Instrument service dates. Asking for data before these returns nothing and
-# burns a request, so those chunks are skipped up front.
-SENSOR_FIRST_LIGHT = {
-    'MODIS': date(2000, 11, 1),        # Terra; Aqua from 2002
-    'VIIRS_SNPP': date(2012, 1, 20),
-    'VIIRS_NOAA20': date(2018, 1, 1),
-    'VIIRS_NOAA21': date(2024, 1, 1),
+# Fallback coverage, used only when the data_availability endpoint cannot be
+# reached. The live endpoint is authoritative and is queried first — these
+# dates were read from it on 2026-09-13 and will drift as NASA reprocesses.
+FALLBACK_AVAILABILITY = {
+    'MODIS_SP':        (date(2000, 11, 1), date(2026, 5, 31)),
+    'VIIRS_SNPP_SP':   (date(2012, 1, 20), date(2026, 4, 27)),
+    'VIIRS_NOAA20_SP': (date(2018, 4, 1), date(2026, 5, 31)),
+    'VIIRS_NOAA21_NRT': (date(2024, 1, 17), None),
 }
 
 REQUEST_TIMEOUT_S = 120
@@ -174,24 +181,64 @@ def month_chunks(year, month, max_days=MAX_DAY_RANGE):
     return chunks
 
 
-def build_plan(years, months, sources, today=None):
+def fetch_availability(map_key=None):
+    """
+    Asks FIRMS which sources exist and what dates each one covers.
+
+    Returns {source: (min_date, max_date)}. This replaces guessing at instrument
+    service dates: the endpoint reports, for example, that MODIS_NRT only
+    reaches back to 2026-06-01 while MODIS_SP starts at 2000-11-01, which is
+    exactly what decides whether a historical chunk is worth requesting.
+
+    Falls back to FALLBACK_AVAILABILITY if the endpoint cannot be reached, so a
+    network hiccup degrades the plan rather than stopping it.
+    """
+    key = map_key or FIRMS_MAP_KEY
+    if not key:
+        return dict(FALLBACK_AVAILABILITY)
+    try:
+        response = requests.get(f"{API_BASE}/data_availability/csv/{key}/ALL",
+                                timeout=REQUEST_TIMEOUT_S)
+        response.raise_for_status()
+        frame = pd.read_csv(StringIO(response.text))
+        out = {}
+        for row in frame.itertuples(index=False):
+            try:
+                lo = date.fromisoformat(str(row.min_date))
+                hi = date.fromisoformat(str(row.max_date))
+            except (ValueError, AttributeError):
+                continue
+            out[str(row.data_id)] = (lo, hi)
+        return out or dict(FALLBACK_AVAILABILITY)
+    except Exception as e:
+        logger.warning(f"Could not read data availability ({redact_key(e)}); "
+                       f"using the built-in fallback dates.")
+        return dict(FALLBACK_AVAILABILITY)
+
+
+def build_plan(years, months, sources, today=None, availability=None):
     """
     Returns the list of (source, start_date, day_range) to fetch.
 
-    Chunks before an instrument existed, or in the future, are dropped rather
-    than requested — each would cost an API call and return nothing.
+    Chunks outside a source's published coverage are dropped rather than
+    requested: each one would cost an API call and return an empty CSV.
     """
     today = today or datetime.now(timezone.utc).date()
+    availability = FALLBACK_AVAILABILITY if availability is None else availability
+
     plan, skipped = [], []
     for source in sources:
-        family, _ = split_source(source)
-        first_light = SENSOR_FIRST_LIGHT.get(family, date(2000, 1, 1))
+        lo, hi = availability.get(source, (date(2000, 1, 1), None))
         for year in years:
             for month in months:
                 for start, span in month_chunks(year, month):
                     start_d = date.fromisoformat(start)
-                    if start_d + timedelta(days=span - 1) < first_light:
-                        skipped.append((source, start, f'before {family} first light'))
+                    end_d = start_d + timedelta(days=span - 1)
+                    if lo and end_d < lo:
+                        skipped.append((source, start, f'{source} coverage starts {lo}'))
+                        continue
+                    if hi and start_d > hi:
+                        skipped.append((source, start, f'{source} coverage ends {hi}'))
                         continue
                     if start_d > today:
                         skipped.append((source, start, 'in the future'))
@@ -396,6 +443,9 @@ def main(argv=None):
                         help='show the plan and the API cost, fetch nothing')
     parser.add_argument('--no-resume', action='store_true',
                         help='re-fetch every chunk, including completed ones')
+    parser.add_argument('--no-availability-check', action='store_true',
+                        help='skip the data_availability lookup and use the '
+                             'built-in fallback coverage dates')
     parser.add_argument('--retry-empty', action='store_true',
                         help='also re-check windows previously recorded as empty '
                              '(useful when SP may have been produced since)')
@@ -407,7 +457,9 @@ def main(argv=None):
         parser.error('--months must be between 1 and 12')
     sources = [s.strip() for s in args.sources.split(',') if s.strip()]
 
-    plan, skipped = build_plan(years, months, sources)
+    # Ask FIRMS what it actually has before deciding what to request.
+    availability = fetch_availability() if not args.no_availability_check else None
+    plan, skipped = build_plan(years, months, sources, availability=availability)
 
     print()
     print('=== FIRMS archive backfill ===')
@@ -415,6 +467,13 @@ def main(argv=None):
     print(f"  months  : {', '.join(str(m) for m in months)}")
     print(f"  sources : {', '.join(sources)}")
     print(f"  area    : {INDIA_AREA} (west,south,east,north)")
+    if availability:
+        print()
+        print('  Coverage reported by FIRMS:')
+        for source in sources:
+            lo, hi = availability.get(source, (None, None))
+            mark = '' if source in availability else '   (not listed by FIRMS!)'
+            print(f"    {source:<18} {lo} .. {hi}{mark}")
     print()
     print(f"  API requests planned : {len(plan)}")
     print(f"  MAP_KEY budget       : 5000 per 10 minutes "
@@ -462,14 +521,24 @@ def main(argv=None):
             try:
                 csv_text = fetch_chunk(source, start, span)
 
-                # SP lags NRT by months. When the archive has not been produced
-                # for a window yet, fall back to the NRT stream rather than
-                # leaving a hole — `processing` records which one was used.
+                # SP lags NRT by months, so an empty SP window near the present
+                # may still exist in NRT. For older dates it cannot: NRT carries
+                # only a few recent months (FIRMS reports MODIS_NRT starting
+                # 2026-06-01), so falling back there would spend a request to
+                # receive a header row. Only try it when NRT actually covers
+                # the window.
                 if not looks_like_csv(csv_text) and source in NRT_FALLBACK:
-                    used_source = NRT_FALLBACK[source]
-                    logger.info(f"{label}: no SP data, trying {used_source}")
-                    csv_text = fetch_chunk(used_source, start, span)
-                    time.sleep(args.sleep)
+                    fallback = NRT_FALLBACK[source]
+                    nrt_lo, nrt_hi = (availability or {}).get(fallback, (None, None))
+                    chunk_end = date.fromisoformat(start) + timedelta(days=span - 1)
+                    covered = (nrt_lo is None) or (
+                        chunk_end >= nrt_lo and (nrt_hi is None or
+                                                 date.fromisoformat(start) <= nrt_hi))
+                    if covered:
+                        used_source = fallback
+                        logger.info(f"{label}: no SP data, trying {used_source}")
+                        csv_text = fetch_chunk(used_source, start, span)
+                        time.sleep(args.sleep)
 
                 if not looks_like_csv(csv_text):
                     empty += 1

@@ -89,7 +89,7 @@ winter seasons of past years, use the archive backfill:
 # See the plan and the API cost first — it fetches nothing
 python scripts/backfill_firms_archive.py --dry-run
 
-# Jan / Oct / Nov / Dec of 2020-2025, three sensors: 270 requests, ~15 min
+# Jan / Oct / Nov / Dec of 2020-2025, three sensors: 486 requests, ~25 min
 python scripts/backfill_firms_archive.py
 
 # Narrower

@@ -7,6 +7,7 @@ contains only modules the pipeline actually imports.
 | Script | Purpose |
 |---|---|
 | `migrate_db.py` | Rebuilds tables against the current `schema.sql`, backfilling hashes and `valid_time`. Takes a backup first. |
+| `diagnose_firms_api.py` | Run when the backfill returns 400/401/empty. Probes the MAP_KEY, the source list and each URL parameter in turn, printing full response bodies. Key is redacted. |
 | `backfill_firms_archive.py` | **Historical NASA FIRMS fire data.** Resumable, rate-limited, dry-run first. Default window is Jan/Oct/Nov/Dec 2020-2025 (stubble-burning + winter). |
 | `migrate_to_v2_schema.py` | Renames the pre-v2 tables (`*_cpcb`, `*_imd`, `*_sentinel5p`) and quarantines the synthetic GFS rows. Run once. |
 | `migrate_sqlite_to_parquet.py` | Backfills the Parquet lake from an existing SQLite database. |

@@ -167,10 +167,34 @@ fetch can never downgrade an SP row back.
 | | |
 |---|---|
 | **Endpoint** | `/api/area/csv/{MAP_KEY}/{SOURCE}/{bbox}/{DAY_RANGE}/{START_DATE}` |
-| **DAY_RANGE** | 1–10 days per request (hard limit) |
+| **DAY_RANGE** | **1–5** days per request |
 | **START_DATE** | returns `START_DATE .. START_DATE + DAY_RANGE - 1` |
 | **Rate limit** | 5000 requests per 10-minute window, per MAP_KEY |
-| **Coverage** | MODIS from Nov 2000, VIIRS S-NPP from Jan 2012, NOAA-20 from 2018 |
+
+> **DAY_RANGE is 5, not 10.** NASA's own API page documents `1..10`. The live
+> server rejects anything above 5 with
+> `HTTP 400 — Invalid day range. Expects [1..5].`
+> Verified against the endpoint on 2026-09-13. The server wins.
+
+### Coverage, as reported by the API itself
+
+Do not hardcode these — `/api/data_availability/csv/{MAP_KEY}/ALL` returns them,
+and they move as NASA reprocesses. Read on 2026-09-13:
+
+| Source | From | To |
+|---|---|---|
+| `MODIS_SP` | 2000-11-01 | 2026-05-31 |
+| `VIIRS_SNPP_SP` | 2012-01-20 | 2026-04-27 |
+| `VIIRS_NOAA20_SP` | 2018-04-01 | 2026-05-31 |
+| `VIIRS_NOAA21_NRT` | 2024-01-17 | current |
+| `MODIS_NRT` | 2026-06-01 | current |
+| `VIIRS_SNPP_NRT` | 2026-04-28 | current |
+| `VIIRS_NOAA20_NRT` | 2026-06-01 | current |
+
+Two things follow. The **SP archives lag the present by three to four months**,
+so recent weeks exist only in NRT. And the **NRT streams reach back only a few
+months**, so falling back from SP to NRT is worth a request near the present and
+is guaranteed to waste one for any historical date.
 
 `scripts/backfill_firms_archive.py` plans the chunks, skips dates before an
 instrument existed, falls back from SP to NRT where the archive has not been
