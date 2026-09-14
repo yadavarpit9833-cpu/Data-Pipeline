@@ -234,9 +234,15 @@ python monitor_health.py
 
 ## Historical backfill
 
-The live fetchers only reach near-real-time feeds. FIRMS NRT, for instance, spans
-roughly the last two months, so historical fire data needs the Standard Processing
-(SP) archives instead:
+The live fetchers only reach near-real-time feeds, so the pipeline holds nothing
+from before the day it started. Two scripts load history instead, both defaulting
+to the same window — January, October, November and December of 2020–2025 —
+so fire and weather line up and can actually be compared.
+
+### Fire — `backfill_firms.py`
+
+FIRMS NRT spans roughly the last two months, so historical fire data needs the
+Standard Processing (SP) archives:
 
 ```bash
 python backfill_firms.py                       # Jan/Oct/Nov/Dec of 2020-2025
@@ -283,6 +289,63 @@ reports the current budget:
 ```bash
 curl "https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=$FIRMS_MAP_KEY"
 ```
+
+### Weather — `backfill_weather.py`
+
+Open-Meteo's reanalysis archive reaches back to 1940 and needs no API key:
+
+```bash
+python backfill_weather.py                     # Jan/Oct/Nov/Dec of 2020-2025
+python backfill_weather.py --years 2023 2024
+python backfill_weather.py --dry-run
+```
+
+It polls the same 11 stations as `fetch_weather.py` and applies the same QC
+thresholds, including the circular check on wind direction.
+
+**`wind_speed_unit=ms` is not optional.** Open-Meteo returns km/h by default while
+the live fetcher asks for m/s. Mixing the two in one column would corrupt any
+analysis spanning live and backfilled rows without ever raising an error.
+
+Contiguous months collapse into a single request, so October–December is one span
+rather than three: 132 requests against the 324 the FIRMS backfill needs, because
+the archive endpoint takes a date range where the FIRMS area API caps at five days.
+
+Measured: 194,832 rows for the default window in about five minutes, zero contract
+failures — 11 stations × 123 days × 24 hours × 6 years.
+
+## Analysis
+
+`analyze_fire_weather.py` joins daily FIRMS detections inside a lat/lon box to one
+station's daily weather and reports Pearson and Spearman — pooled, inside the
+burning window, and per year — plus a rain-suppression test.
+
+```bash
+python analyze_fire_weather.py                            # stubble belt vs Delhi
+python analyze_fire_weather.py --station Lucknow
+python analyze_fire_weather.py --belt 24 31 74 88 --years 2023 2025
+```
+
+It needs both backfills to have run over the same window. Three things decide
+whether any number it prints means anything:
+
+- **Pooled figures are confounded by season.** January is cold and quiet, November
+  warm and peaking, so a pooled temperature correlation mostly measures the
+  calendar. Pooled temperature reads `+0.65` Spearman and collapses to `-0.12`
+  inside October–November. Read the burning window.
+- **A correlation is only trustworthy if its sign holds across years.** That is what
+  the per-year table is for. Rainfall stays negative in every year that had rain
+  (−0.28 to −0.55); temperature flips sign three times and is therefore noise.
+- **Cloud cover suppresses detections as well as burning.** Rain days are cloudy
+  days and the sensor sees less through cloud, so the rain result mixes a real
+  effect with an observational artefact. Separating them needs cloud-mask data this
+  pipeline does not carry.
+
+The strongest signal in the default window is rain: median 45 detections the day
+after rain against 318 after a dry day, a ratio of 0.14.
+
+One structural caveat — the station list has nothing in Punjab, so Delhi stands in
+at roughly 250 km from the belt.
 
 ## Data quality control
 
@@ -352,6 +415,8 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `diagnose_gfs.py` | GFS coverage, cycles and valid times |
 | `inspect_firms.py` | FIRMS entries and duplicate check |
 | `backfill_firms.py` | Load historical FIRMS fires from the SP archives |
+| `backfill_weather.py` | Load historical weather from the Open-Meteo archive |
+| `analyze_fire_weather.py` | Correlate belt fire counts against station weather |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
 | `migrate_db.py` | Rebuild tables against the current schema |
 | `migrate_sqlite_to_parquet.py` | Export existing SQLite rows into the Parquet lake |
