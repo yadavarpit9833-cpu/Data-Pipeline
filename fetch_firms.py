@@ -127,7 +127,18 @@ def main():
         return ('failure', 0, "; ".join(sensor_errors) if sensor_errors else "No data from FIRMS sensors")
         
     combined_df = pd.concat(all_dfs, ignore_index=True)
-    
+
+    # BUGFIX: only MODIS reports a 'brightness' column. VIIRS reports the I-4
+    # channel brightness temperature as 'bright_ti4', so after the concat every
+    # VIIRS row was landing with brightness_raw = NULL - and VIIRS is the
+    # higher-resolution sensor supplying most of the rows. Fold it in first, so
+    # the rename below sees one unified column.
+    if 'bright_ti4' in combined_df.columns:
+        if 'brightness' not in combined_df.columns:
+            combined_df['brightness'] = combined_df['bright_ti4']
+        else:
+            combined_df['brightness'] = combined_df['brightness'].fillna(combined_df['bright_ti4'])
+
     # Standardize names
     combined_df.rename(columns={
         'latitude': 'lat',
