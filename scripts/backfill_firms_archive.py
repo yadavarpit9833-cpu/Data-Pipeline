@@ -215,6 +215,136 @@ def fetch_availability(map_key=None):
         return dict(FALLBACK_AVAILABILITY)
 
 
+# ── Gap filling ─────────────────────────────────────────────────────────────
+
+# Each instrument family, and the two streams it can be served from. SP is the
+# reprocessed archive and is preferred; NRT is the only option near the present,
+# because SP lags by three to four months.
+SOURCE_FAMILIES = {
+    'MODIS':        ('MODIS_SP', 'MODIS_NRT'),
+    'VIIRS_SNPP':   ('VIIRS_SNPP_SP', 'VIIRS_SNPP_NRT'),
+    'VIIRS_NOAA20': ('VIIRS_NOAA20_SP', 'VIIRS_NOAA20_NRT'),
+}
+
+
+def covers(availability, source, day):
+    """True when `source` publishes data for `day`."""
+    lo, hi = availability.get(source, (None, None))
+    if lo and day < lo:
+        return False
+    if hi and day > hi:
+        return False
+    return source in availability
+
+
+def select_source_for_date(family, day, availability):
+    """
+    Picks which stream can serve one date for one instrument family.
+
+    SP first: it is the reprocessed, authoritative version, and the upsert lets
+    it supersede an NRT row for the same detection. NRT only when SP does not
+    reach that date yet. None when neither covers it, so no request is spent.
+    """
+    sp_source, nrt_source = SOURCE_FAMILIES.get(family, (None, None))
+    if sp_source and covers(availability, sp_source, day):
+        return sp_source
+    if nrt_source and covers(availability, nrt_source, day):
+        return nrt_source
+    return None
+
+
+def dates_with_data(conn, family):
+    """Dates that already hold at least one detection for this family."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT DISTINCT substr(timestamp, 1, 10) FROM cleaned_firms "
+                    "WHERE sensor = ?", (family,))
+        out = set()
+        for (value,) in cur.fetchall():
+            try:
+                out.add(date.fromisoformat(str(value)))
+            except (ValueError, TypeError):
+                continue
+        return out
+    except Exception:
+        return set()
+
+
+def dates_known_empty(conn, family):
+    """
+    Dates a previous run already established have no detections.
+
+    Without this every genuinely fireless day would look like a gap forever and
+    be re-requested on every run. The manifest records the chunk, so its whole
+    window is expanded back into individual dates.
+    """
+    sp_source, nrt_source = SOURCE_FAMILIES.get(family, (None, None))
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT start_date, day_range FROM firms_backfill_manifest "
+                    "WHERE status = 'empty' AND source IN (?, ?)",
+                    (sp_source, nrt_source))
+        out = set()
+        for start, span in cur.fetchall():
+            try:
+                first = date.fromisoformat(str(start))
+            except (ValueError, TypeError):
+                continue
+            out.update(first + timedelta(days=i) for i in range(int(span or 1)))
+        return out
+    except Exception:
+        return set()
+
+
+def build_gap_plan(conn, since, until, families=None, availability=None, max_days=None):
+    """
+    Returns (plan, gap_summary) for the dates that have no data yet.
+
+    A gap is a date in the window with no stored detections for that family and
+    no record of a previous run finding it empty. Consecutive gap dates served
+    by the same source are merged into chunks so a two-week outage costs three
+    requests rather than fourteen.
+    """
+    availability = FALLBACK_AVAILABILITY if availability is None else availability
+    families = families or list(SOURCE_FAMILIES)
+    max_days = max_days or MAX_DAY_RANGE
+
+    plan, summary = [], {}
+    for family in families:
+        have = dates_with_data(conn, family) | dates_known_empty(conn, family)
+
+        # (date, source) for every missing day we can actually request
+        missing = []
+        day = since
+        while day <= until:
+            if day not in have:
+                source = select_source_for_date(family, day, availability)
+                if source:
+                    missing.append((day, source))
+            day += timedelta(days=1)
+
+        summary[family] = len(missing)
+
+        # Merge runs of consecutive days that share a source.
+        run_start = run_source = None
+        run_len = 0
+        for day, source in missing:
+            contiguous = (run_start is not None
+                          and source == run_source
+                          and day == run_start + timedelta(days=run_len)
+                          and run_len < max_days)
+            if contiguous:
+                run_len += 1
+                continue
+            if run_start is not None:
+                plan.append((run_source, run_start.isoformat(), run_len))
+            run_start, run_source, run_len = day, source, 1
+        if run_start is not None:
+            plan.append((run_source, run_start.isoformat(), run_len))
+
+    return plan, summary
+
+
 def build_plan(years, months, sources, today=None, availability=None):
     """
     Returns the list of (source, start_date, day_range) to fetch.
@@ -465,117 +595,19 @@ def rebuild_parquet_from_db(conn):
     return failed
 
 
-def parse_int_list(text, name):
-    values = []
-    for part in str(text).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part and not part.startswith('-'):
-            lo, hi = part.split('-', 1)
-            values.extend(range(int(lo), int(hi) + 1))
-        else:
-            values.append(int(part))
-    if not values:
-        raise ValueError(f"--{name} produced no values")
-    return sorted(set(values))
+def execute_plan(conn, plan, args, availability, resume=True):
+    """
+    Fetches and stores every chunk in `plan`. Shared by the year/month backfill
+    and by --fill-gaps so both get the same retry, resume, upsert and
+    Parquet-failure handling.
 
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--years', default='2020-2025',
-                        help="e.g. '2020-2025' or '2023,2024' (default: 2020-2025)")
-    parser.add_argument('--months', default='1,10,11,12',
-                        help='1-12, comma separated (default: 1,10,11,12 — '
-                             'the stubble-burning and winter season)')
-    parser.add_argument('--sources', default=','.join(DEFAULT_SOURCES),
-                        help='FIRMS API sources (default: the three SP archives)')
-    parser.add_argument('--sleep', type=float, default=DEFAULT_SLEEP_S,
-                        help='seconds between requests (default: 1.0)')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='show the plan and the API cost, fetch nothing')
-    parser.add_argument('--rebuild-parquet', action='store_true',
-                        help='regenerate the Parquet lake from cleaned_firms and '
-                             'exit. Makes no API calls — use this when the rows '
-                             'reached the database but Parquet writes failed.')
-    parser.add_argument('--no-resume', action='store_true',
-                        help='re-fetch every chunk, including completed ones')
-    parser.add_argument('--no-availability-check', action='store_true',
-                        help='skip the data_availability lookup and use the '
-                             'built-in fallback coverage dates')
-    parser.add_argument('--retry-empty', action='store_true',
-                        help='also re-check windows previously recorded as empty '
-                             '(useful when SP may have been produced since)')
-    args = parser.parse_args(argv)
-
-    if args.rebuild_parquet:
-        init_db()
-        conn = get_db_connection()
-        print()
-        print('=== Rebuilding the FIRMS Parquet lake from the database ===')
-        print('    (no API calls)')
-        try:
-            return 1 if rebuild_parquet_from_db(conn) else 0
-        finally:
-            conn.close()
-
-    years = parse_int_list(args.years, 'years')
-    months = parse_int_list(args.months, 'months')
-    if any(m < 1 or m > 12 for m in months):
-        parser.error('--months must be between 1 and 12')
-    sources = [s.strip() for s in args.sources.split(',') if s.strip()]
-
-    # Ask FIRMS what it actually has before deciding what to request.
-    availability = fetch_availability() if not args.no_availability_check else None
-    plan, skipped = build_plan(years, months, sources, availability=availability)
-
-    print()
-    print('=== FIRMS archive backfill ===')
-    print(f"  years   : {years[0]}-{years[-1]}  ({len(years)} years)")
-    print(f"  months  : {', '.join(str(m) for m in months)}")
-    print(f"  sources : {', '.join(sources)}")
-    print(f"  area    : {INDIA_AREA} (west,south,east,north)")
-    if availability:
-        print()
-        print('  Coverage reported by FIRMS:')
-        for source in sources:
-            lo, hi = availability.get(source, (None, None))
-            mark = '' if source in availability else '   (not listed by FIRMS!)'
-            print(f"    {source:<18} {lo} .. {hi}{mark}")
-    print()
-    print(f"  API requests planned : {len(plan)}")
-    print(f"  MAP_KEY budget       : 5000 per 10 minutes "
-          f"({len(plan) / 5000:.1%} of one window)")
-    est = len(plan) * (args.sleep + 2.0) / 60
-    print(f"  rough runtime        : {est:.0f} min at {args.sleep}s between requests")
-    if skipped:
-        print(f"  chunks skipped       : {len(skipped)} (instrument not in service, "
-              f"or future dates)")
-
-    if args.dry_run:
-        print()
-        print('DRY RUN — nothing fetched.')
-        for source, start, span in plan[:5]:
-            print(f"    would GET {source} {start} +{span}d")
-        if len(plan) > 5:
-            print(f"    ... and {len(plan) - 5} more")
-        return 0
-
-    if not FIRMS_MAP_KEY or FIRMS_MAP_KEY == 'your_firms_map_key_here':
-        print()
-        print('ERROR: FIRMS_MAP_KEY is missing or still the placeholder in .env.')
-        print('Get a free key: https://firms.modaps.eosdis.nasa.gov/api/map_key/')
-        return 1
-
-    init_db()
-    conn = get_db_connection()
-    ensure_manifest(conn)
-
-    done = set() if args.no_resume else completed_chunks(
-        conn, include_empty=not args.retry_empty)
-    if done:
-        print(f"  already fetched      : {len(done)} chunk(s) — resuming")
+    Returns a process exit code.
+    """
+    done = set()
+    if resume and not args.no_resume:
+        done = completed_chunks(conn, include_empty=not args.retry_empty)
+        if done:
+            print(f"  already fetched      : {len(done)} chunk(s) — resuming")
 
     print()
     stored = attempted = failed = empty = partial = 0
@@ -649,9 +681,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print()
         print('Interrupted. Progress is recorded — re-run to resume.')
-    finally:
-        conn.close()
-
+    
     print()
     print('=== Summary ===')
     print(f"  chunks attempted : {attempted}")
@@ -665,6 +695,195 @@ def main(argv=None):
     print()
     print('  Next: python gold_layer.py   # rebuild the gold tables over the new data')
     return 1 if failed and not stored else 0
+
+
+def run_gap_fill(args):
+    """Finds the dates with no data and fetches only those."""
+    today = datetime.now(timezone.utc).date()
+    since = (date.fromisoformat(args.since) if args.since
+             else today - timedelta(days=90))
+    # Yesterday by default: today is still being observed, so treating it as a
+    # gap would re-request a partial day on every run.
+    until = date.fromisoformat(args.until) if args.until else today - timedelta(days=1)
+    if since > until:
+        print(f"--since {since} is after --until {until}; nothing to check.")
+        return 1
+
+    init_db()
+    conn = get_db_connection()
+    ensure_manifest(conn)
+    try:
+        availability = (None if args.no_availability_check else fetch_availability())
+        plan, summary = build_gap_plan(conn, since, until, availability=availability)
+
+        print()
+        print('=== FIRMS gap fill ===')
+        print(f"  window  : {since} .. {until}  ({(until - since).days + 1} days)")
+        print()
+        for family, missing in summary.items():
+            total = (until - since).days + 1
+            print(f"    {family:<14} {missing:>4} of {total} day(s) missing")
+        print()
+        print(f"  API requests planned : {len(plan)}")
+
+        if not plan:
+            print()
+            print('  No gaps. Every day in the window is either stored or known empty.')
+            return 0
+
+        # Show which stream each gap will come from: SP for older dates, NRT
+        # near the present, since SP lags by months.
+        streams = {}
+        for source, _, _ in plan:
+            streams[source] = streams.get(source, 0) + 1
+        print('  by source:')
+        for source, count in sorted(streams.items()):
+            print(f"    {source:<20} {count}")
+
+        if args.dry_run:
+            print()
+            print('DRY RUN — nothing fetched.')
+            for source, start, span in plan[:8]:
+                print(f"    would GET {source} {start} +{span}d")
+            if len(plan) > 8:
+                print(f"    ... and {len(plan) - 8} more")
+            return 0
+
+        if not FIRMS_MAP_KEY or FIRMS_MAP_KEY == 'your_firms_map_key_here':
+            print('\nERROR: FIRMS_MAP_KEY is missing or still the placeholder in .env.')
+            return 1
+
+        print()
+        return execute_plan(conn, plan, args, availability, resume=False)
+    finally:
+        conn.close()
+
+
+def parse_int_list(text, name):
+    values = []
+    for part in str(text).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part and not part.startswith('-'):
+            lo, hi = part.split('-', 1)
+            values.extend(range(int(lo), int(hi) + 1))
+        else:
+            values.append(int(part))
+    if not values:
+        raise ValueError(f"--{name} produced no values")
+    return sorted(set(values))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--years', default='2020-2025',
+                        help="e.g. '2020-2025' or '2023,2024' (default: 2020-2025)")
+    parser.add_argument('--months', default='1,10,11,12',
+                        help='1-12, comma separated (default: 1,10,11,12 — '
+                             'the stubble-burning and winter season)')
+    parser.add_argument('--sources', default=','.join(DEFAULT_SOURCES),
+                        help='FIRMS API sources (default: the three SP archives)')
+    parser.add_argument('--sleep', type=float, default=DEFAULT_SLEEP_S,
+                        help='seconds between requests (default: 1.0)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='show the plan and the API cost, fetch nothing')
+    parser.add_argument('--fill-gaps', action='store_true',
+                        help='fetch only the dates that have no data yet, instead '
+                             'of a fixed year/month window. Use this after the '
+                             'scheduler has been down.')
+    parser.add_argument('--since', default=None,
+                        help='with --fill-gaps: earliest date to check '
+                             '(YYYY-MM-DD, default: 90 days ago)')
+    parser.add_argument('--until', default=None,
+                        help='with --fill-gaps: latest date to check '
+                             '(YYYY-MM-DD, default: yesterday)')
+    parser.add_argument('--rebuild-parquet', action='store_true',
+                        help='regenerate the Parquet lake from cleaned_firms and '
+                             'exit. Makes no API calls — use this when the rows '
+                             'reached the database but Parquet writes failed.')
+    parser.add_argument('--no-resume', action='store_true',
+                        help='re-fetch every chunk, including completed ones')
+    parser.add_argument('--no-availability-check', action='store_true',
+                        help='skip the data_availability lookup and use the '
+                             'built-in fallback coverage dates')
+    parser.add_argument('--retry-empty', action='store_true',
+                        help='also re-check windows previously recorded as empty '
+                             '(useful when SP may have been produced since)')
+    args = parser.parse_args(argv)
+
+    if args.rebuild_parquet:
+        init_db()
+        conn = get_db_connection()
+        print()
+        print('=== Rebuilding the FIRMS Parquet lake from the database ===')
+        print('    (no API calls)')
+        try:
+            return 1 if rebuild_parquet_from_db(conn) else 0
+        finally:
+            conn.close()
+
+    if args.fill_gaps:
+        return run_gap_fill(args)
+
+    years = parse_int_list(args.years, 'years')
+    months = parse_int_list(args.months, 'months')
+    if any(m < 1 or m > 12 for m in months):
+        parser.error('--months must be between 1 and 12')
+    sources = [s.strip() for s in args.sources.split(',') if s.strip()]
+
+    # Ask FIRMS what it actually has before deciding what to request.
+    availability = fetch_availability() if not args.no_availability_check else None
+    plan, skipped = build_plan(years, months, sources, availability=availability)
+
+    print()
+    print('=== FIRMS archive backfill ===')
+    print(f"  years   : {years[0]}-{years[-1]}  ({len(years)} years)")
+    print(f"  months  : {', '.join(str(m) for m in months)}")
+    print(f"  sources : {', '.join(sources)}")
+    print(f"  area    : {INDIA_AREA} (west,south,east,north)")
+    if availability:
+        print()
+        print('  Coverage reported by FIRMS:')
+        for source in sources:
+            lo, hi = availability.get(source, (None, None))
+            mark = '' if source in availability else '   (not listed by FIRMS!)'
+            print(f"    {source:<18} {lo} .. {hi}{mark}")
+    print()
+    print(f"  API requests planned : {len(plan)}")
+    print(f"  MAP_KEY budget       : 5000 per 10 minutes "
+          f"({len(plan) / 5000:.1%} of one window)")
+    est = len(plan) * (args.sleep + 2.0) / 60
+    print(f"  rough runtime        : {est:.0f} min at {args.sleep}s between requests")
+    if skipped:
+        print(f"  chunks skipped       : {len(skipped)} (instrument not in service, "
+              f"or future dates)")
+
+    if args.dry_run:
+        print()
+        print('DRY RUN — nothing fetched.')
+        for source, start, span in plan[:5]:
+            print(f"    would GET {source} {start} +{span}d")
+        if len(plan) > 5:
+            print(f"    ... and {len(plan) - 5} more")
+        return 0
+
+    if not FIRMS_MAP_KEY or FIRMS_MAP_KEY == 'your_firms_map_key_here':
+        print()
+        print('ERROR: FIRMS_MAP_KEY is missing or still the placeholder in .env.')
+        print('Get a free key: https://firms.modaps.eosdis.nasa.gov/api/map_key/')
+        return 1
+
+    init_db()
+    conn = get_db_connection()
+    ensure_manifest(conn)
+    print()
+    try:
+        return execute_plan(conn, plan, args, availability)
+    finally:
+        conn.close()
+
 
 
 if __name__ == '__main__':

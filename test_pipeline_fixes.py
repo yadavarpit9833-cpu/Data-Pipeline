@@ -1106,3 +1106,131 @@ class TestParquetTypeHarmonisation(unittest.TestCase):
         frame['daynight'] = [None]
         path = self._write(frame)
         self.assertTrue(pd.isna(pd.read_parquet(path)['daynight'].iloc[0]))
+
+
+class TestFIRMSGapFill(unittest.TestCase):
+    """
+    --fill-gaps covers the case the year/month backfill cannot: the scheduler
+    was down for a while and some days have no data. Re-running the full
+    backfill would re-request hundreds of days that are already stored.
+    """
+
+    AVAILABILITY = {
+        'MODIS_SP':         (date(2000, 11, 1), date(2026, 5, 31)),
+        'MODIS_NRT':        (date(2026, 6, 1), date(2026, 9, 13)),
+        'VIIRS_SNPP_SP':    (date(2012, 1, 20), date(2026, 4, 27)),
+        'VIIRS_SNPP_NRT':   (date(2026, 4, 28), date(2026, 9, 13)),
+        'VIIRS_NOAA20_SP':  (date(2018, 4, 1), date(2026, 5, 31)),
+        'VIIRS_NOAA20_NRT': (date(2026, 6, 1), date(2026, 9, 13)),
+    }
+
+    def setUp(self):
+        from scripts.backfill_firms_archive import ensure_manifest
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, 'gaps.db')
+        schema = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'schema.sql')
+        self.conn = sqlite3.connect(self.db_path)
+        with open(schema, encoding='utf-8') as fh:
+            self.conn.executescript(fh.read())
+        ensure_manifest(self.conn)
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _store(self, day, family='MODIS'):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO cleaned_firms "
+            "(lat, lon, timestamp, sensor, processing, satellite) VALUES (?,?,?,?,?,?)",
+            (20.0, 78.0, f"{day}T05:00:00+00:00", family, 'NRT', 'Terra'))
+        self.conn.commit()
+
+    def _plan(self, since, until, families=('MODIS',)):
+        from scripts.backfill_firms_archive import build_gap_plan
+        return build_gap_plan(self.conn, since, until, families=list(families),
+                              availability=self.AVAILABILITY)
+
+    def test_standard_processing_is_preferred_over_near_real_time(self):
+        """
+        SP is the reprocessed, authoritative version of the same detections, so
+        it must win wherever it reaches. NRT is only for dates SP has not caught
+        up to — it lags by three to four months.
+        """
+        from scripts.backfill_firms_archive import select_source_for_date
+        pick = lambda d: select_source_for_date('MODIS', d, self.AVAILABILITY)
+        self.assertEqual(pick(date(2020, 11, 5)), 'MODIS_SP')
+        self.assertEqual(pick(date(2026, 5, 15)), 'MODIS_SP')
+        self.assertEqual(pick(date(2026, 7, 1)), 'MODIS_NRT')
+
+    def test_a_date_no_source_covers_is_not_requested(self):
+        from scripts.backfill_firms_archive import select_source_for_date
+        self.assertIsNone(
+            select_source_for_date('VIIRS_NOAA20', date(2005, 1, 1), self.AVAILABILITY))
+
+    def test_only_missing_days_are_requested(self):
+        for i in range(30):
+            day = date(2026, 8, 1) + timedelta(days=i)
+            if not (date(2026, 8, 10) <= day <= date(2026, 8, 21)):
+                self._store(day)
+        _, summary = self._plan(date(2026, 8, 1), date(2026, 8, 30))
+        self.assertEqual(summary['MODIS'], 12, 'outage length mis-detected')
+
+    def test_consecutive_missing_days_are_merged_into_chunks(self):
+        """A twelve-day outage must cost three requests, not twelve."""
+        for i in range(30):
+            day = date(2026, 8, 1) + timedelta(days=i)
+            if not (date(2026, 8, 10) <= day <= date(2026, 8, 21)):
+                self._store(day)
+        plan, _ = self._plan(date(2026, 8, 1), date(2026, 8, 30))
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(sum(span for _, _, span in plan), 12)
+        for _, _, span in plan:
+            self.assertLessEqual(span, 5, 'chunk exceeds the API day-range limit')
+
+    def test_a_window_with_no_gaps_costs_nothing(self):
+        for i in range(9):
+            self._store(date(2026, 8, 1) + timedelta(days=i))
+        plan, _ = self._plan(date(2026, 8, 1), date(2026, 8, 9))
+        self.assertEqual(plan, [])
+
+    def test_days_already_known_to_be_empty_are_not_re_requested(self):
+        """
+        A day with genuinely no fires has no rows, so without the manifest it
+        would look like a gap forever and be re-requested on every run.
+        """
+        for i in range(30):
+            day = date(2026, 8, 1) + timedelta(days=i)
+            if not (date(2026, 8, 10) <= day <= date(2026, 8, 21)):
+                self._store(day)
+        self.conn.execute(
+            "INSERT INTO firms_backfill_manifest "
+            "(source, start_date, day_range, status, fetched_at) "
+            "VALUES ('MODIS_NRT', '2026-08-10', 5, 'empty', 't')")
+        self.conn.commit()
+        _, summary = self._plan(date(2026, 8, 1), date(2026, 8, 30))
+        self.assertEqual(summary['MODIS'], 7)
+
+    def test_a_gap_spanning_the_archive_boundary_splits_by_source(self):
+        """
+        MODIS_SP ends 2026-05-31 and MODIS_NRT starts 2026-06-01, so a gap
+        crossing that date cannot be served by one stream.
+        """
+        plan, _ = self._plan(date(2026, 5, 28), date(2026, 6, 4))
+        sources = {source for source, _, _ in plan}
+        self.assertEqual(sources, {'MODIS_SP', 'MODIS_NRT'})
+        for source, start, span in plan:
+            last = date.fromisoformat(start) + timedelta(days=span - 1)
+            if source.endswith('_SP'):
+                self.assertLessEqual(last, date(2026, 5, 31))
+            else:
+                self.assertGreaterEqual(date.fromisoformat(start), date(2026, 6, 1))
+
+    def test_each_sensor_family_is_tracked_separately(self):
+        """MODIS having data says nothing about whether VIIRS does."""
+        for i in range(5):
+            self._store(date(2026, 8, 1) + timedelta(days=i), family='MODIS')
+        _, summary = self._plan(date(2026, 8, 1), date(2026, 8, 5),
+                                families=('MODIS', 'VIIRS_SNPP'))
+        self.assertEqual(summary['MODIS'], 0)
+        self.assertEqual(summary['VIIRS_SNPP'], 5)

@@ -96,6 +96,25 @@ python scripts/backfill_firms_archive.py
 python scripts/backfill_firms_archive.py --years 2023,2024 --months 10,11
 ```
 
+If the scheduler has been down and recent days are missing, fill only those:
+
+```bash
+python scripts/backfill_firms_archive.py --fill-gaps --dry-run
+python scripts/backfill_firms_archive.py --fill-gaps
+```
+
+It checks the last 90 days per sensor, skips days already stored and days a
+previous run found empty, merges what is left into chunks, and picks the right
+stream per date — the SP archive where it reaches, NRT for the recent months it
+has not caught up to. A twelve-day outage costs three requests.
+
+If rows reached the database but Parquet writes failed, regenerate the lake
+without spending any API calls:
+
+```bash
+python scripts/backfill_firms_archive.py --rebuild-parquet
+```
+
 It is resumable: an interrupted run continues where it stopped. See
 [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) for why NRT and SP are stored as
 separate `processing` values rather than as different sensors.
