@@ -5,6 +5,56 @@ forecast, satellite and active-fire data, runs a shared quality-control chain ov
 and lands it in a medallion architecture (raw → cleaned → gold) backed by SQLite and a
 Parquet data lake.
 
+## Quick start
+
+```bash
+pip install -r requirements.txt     # deps (GFS also needs the ecCodes system library)
+python db.py                        # create env_data.db from schema.sql
+printf 'WAQI_TOKEN=...\nFIRMS_MAP_KEY=...\n' > .env
+python scheduler.py                 # run everything
+```
+
+Keep the checkout **out of OneDrive** — see [Location](#1-location). Without API keys
+the CPCB and FIRMS jobs log a clean failure and skip; the other four still run.
+
+To verify a single source instead of the whole pipeline:
+
+```bash
+python fetch_weather.py             # no API key needed
+python monitor_health.py            # per-source freshness report
+```
+
+## How data flows
+
+```mermaid
+flowchart LR
+    CPCB[CPCB via WAQI]:::src --> RAW
+    FIRMS[NASA FIRMS]:::src --> RAW
+    OM[Open-Meteo]:::src --> RAW
+    GFS[NOAA GFS GRIB2]:::src --> RAW
+    CAMS[CAMS / Sentinel-5P]:::src --> RAW
+
+    RAW["<b>Bronze — raw</b><br/>raw_* tables<br/>data/raw/"]:::bronze
+    RAW -->|cleaning.py QC chain| QC
+    QC{"range · step<br/>flatline · log-MAD"}:::qc
+    QC -->|contracts.py Pandera| CLEAN
+    CLEAN["<b>Silver — cleaned</b><br/>cleaned_* tables<br/>data/cleaned_*.parquet"]:::silver
+    CLEAN -->|gold_layer.py| GOLD
+    GOLD["<b>Gold — analysis-ready</b><br/>city_aqi_hourly<br/>city_daily_summary<br/>gfs_grid_hourly"]:::gold
+
+    QC -.->|failed rows| CSV["contract_failures_*.csv"]:::fail
+
+    classDef src fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b45
+    classDef bronze fill:#f4e4d4,stroke:#a97142,color:#3d2a17
+    classDef silver fill:#e9ecef,stroke:#868e96,color:#212529
+    classDef gold fill:#fff3bf,stroke:#c99a06,color:#3d3000
+    classDef qc fill:#f3e8fd,stroke:#8d5bc4,color:#2e1a45
+    classDef fail fill:#ffe3e3,stroke:#c92a2a,color:#4a1010
+```
+
+Nothing is discarded along the way: raw payloads stay verbatim, QC failures are
+*flagged* rather than deleted, and gold is derived output that is rebuilt every run.
+
 ## Architecture
 
 Five fetchers plus a gold-layer build, orchestrated by `scheduler.py`:
@@ -34,6 +84,27 @@ the CAMS/Open-Meteo composite rather than direct TROPOMI L2 granules.
   - `gfs_grid_hourly/cycle=<cycle>.parquet` — hourly GFS grid aggregates
   - `city_daily_summary/date=YYYY-MM-DD.parquet` — daily pollutants **left-joined** with
     daily weather on the case-folded city name
+
+#### Sample gold output
+
+`city_aqi_hourly` — hourly AQI per city, category derived from the aggregated `aqi_max`:
+
+| city | hour_bucket | pm25_mean | pm10_mean | aqi_max | aqi_category | n_stations |
+|---|---|---|---|---|---|---|
+| delhi | 2026-09-14T21:00:00+00:00 | 112.0 | 60.0 | 273.6 | Poor | 1 |
+
+`city_daily_summary` — pollutants joined with weather; `wind_dir_daily_mean` is a
+circular mean, and a city with no matching weather station keeps its row with nulls:
+
+| city | pm25_daily_mean | daily_aqi | daily_aqi_category | temp_daily_mean | humidity_daily_mean | rainfall_daily_total | wind_dir_daily_mean | n_weather_obs |
+|---|---|---|---|---|---|---|---|---|
+| delhi | 112.0 | 273.6 | Poor | 28.32 | 80.8 | 0.0 | 106.4 | 5 |
+
+`gfs_grid_hourly` — one row per cycle and valid time over the India bounding box:
+
+| cycle | valid_time | temp_mean | temp_max | precip_total | wind_speed_mean | n_grid_points |
+|---|---|---|---|---|---|---|
+| 20260914_00z | 2026-09-14T00:00:00+00:00 | 20.74 | 33.23 | 0.0 | 2.63 | 14625 |
 
 ### Supporting modules
 
@@ -95,17 +166,20 @@ fetcher log a clean failure and skip — the pipeline does not crash. `.env` is 
 
 ### 5. Running
 
-A single fetcher:
+See [Quick start](#quick-start) for the short version. Any fetcher runs standalone and
+logs its own `pipeline_run_log` row:
 
 ```bash
 python fetch_cpcb.py
 ```
 
-The full orchestration in the foreground:
+The full orchestration in the foreground — Ctrl+C to stop:
 
 ```bash
 python scheduler.py
 ```
+
+To leave it running unattended, register it as a background task instead (next section).
 
 ## Running as a Windows background task
 
