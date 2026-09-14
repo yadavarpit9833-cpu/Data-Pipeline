@@ -46,8 +46,8 @@ before using any of it — the short version:
    │  QC + flags  │   contracts.py  pandera schema per source
    └──────┬───────┘                                          silver
           │                              SQLite/Postgres + Parquet
-   ┌──────┴───────┐
-   │  gold_layer  │  hourly city AQI, GFS grid summaries, daily city summary
+   ┌──────┴───────┐   hourly city AQI, GFS grid summaries, daily city summary,
+   │  gold_layer  │   daily fire activity, per-city fire exposure by distance
    └──────────────┘                                          gold (DuckDB)
 ```
 
@@ -115,6 +115,15 @@ without spending any API calls:
 python scripts/backfill_firms_archive.py --rebuild-parquet
 ```
 
+**After a historical backfill, rebuild gold over the whole lake:**
+
+```bash
+python gold_layer.py --all
+```
+
+The default lookback is 3 days, which is right for the hourly scheduler and
+would skip years of archive data. `--all` reads every partition.
+
 It is resumable: an interrupted run continues where it stopped. See
 [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) for why NRT and SP are stored as
 separate `processing` values rather than as different sensors.
@@ -168,6 +177,24 @@ fields, where a missing value means the model produced none.
 `contracts.py` validates every cleaned frame against a pandera schema before it
 is written. Rows that violate the contract are dropped and appended to
 `data/contract_failures/<source>_<date>.csv`.
+
+---
+
+## Fire exposure as a feature
+
+Two gold tables turn the FIRMS archive into something a model can use:
+
+| Table | Grain | What it holds |
+|---|---|---|
+| `gold/fire_activity_daily` | date × sensor | detection count, high-confidence count, total and peak fire radiative power |
+| `gold/city_fire_exposure_daily` | city × date | fires and FRP within 100 / 300 / 500 km, plus distance to the nearest fire |
+
+The distance bands are the point. Delhi's November particulate load is driven
+largely by stubble burning in Punjab and Haryana, roughly 200–400 km upwind, so
+"fires inside Delhi" is almost always zero and tells you nothing, while "fire
+radiative power within 300 km of Delhi yesterday" tracks the thing that matters.
+FRP is carried alongside the counts because a hundred smouldering detections and
+a hundred intense ones are the same count and nowhere near the same emission.
 
 ---
 

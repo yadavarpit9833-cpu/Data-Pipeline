@@ -1234,3 +1234,134 @@ class TestFIRMSGapFill(unittest.TestCase):
                                 families=('MODIS', 'VIIRS_SNPP'))
         self.assertEqual(summary['MODIS'], 0)
         self.assertEqual(summary['VIIRS_SNPP'], 5)
+
+
+class TestFireGoldTables(unittest.TestCase):
+    """
+    GAP: the archive backfill stored six years of fire detections and no gold
+    table read them — gold_layer.py contained zero references to FIRMS. The
+    default lookback of three days would also have skipped the entire archive
+    even once a table existed.
+    """
+
+    def setUp(self):
+        import storage, gold_layer
+        self.tmp = tempfile.mkdtemp()
+        self.storage, self.gold = storage, gold_layer
+        self._orig = (storage.DATA_DIR, gold_layer.DATA_DIR, gold_layer.GOLD_DIR)
+        storage.DATA_DIR = self.tmp
+        gold_layer.DATA_DIR = self.tmp
+        gold_layer.GOLD_DIR = os.path.join(self.tmp, 'gold')
+
+    def tearDown(self):
+        (self.storage.DATA_DIR, self.gold.DATA_DIR,
+         self.gold.GOLD_DIR) = self._orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _store_fires(self, frame, day='2024-11-05'):
+        save_cleaned_data_parquet(
+            frame, 'firms', 'date', day,
+            ['lat', 'lon', 'timestamp', 'satellite', 'sensor'], pure_overwrite=True)
+
+    def _punjab_cluster(self, n=50, day='2024-11-05'):
+        """Stubble fires around Ludhiana — roughly 250-300 km from Delhi."""
+        return pd.DataFrame({
+            'lat': np.linspace(30.2, 30.8, n),
+            'lon': np.linspace(75.2, 75.8, n),
+            'timestamp': [f'{day}T05:30:00+00:00'] * n,
+            'sensor': ['VIIRS_SNPP'] * n, 'processing': ['SP'] * n,
+            'satellite': ['N'] * n,
+            'frp_mw': np.full(n, 10.0),
+            'brightness_k_clean': np.full(n, 330.0),
+            'confidence_class': ['high'] * n,
+            'is_synthetic': np.zeros(n, dtype=int),
+        })
+
+    def test_haversine_against_known_distances(self):
+        from gold_layer import haversine_km
+        # Delhi -> Mumbai is about 1150 km great-circle.
+        self.assertAlmostEqual(
+            haversine_km(28.61, 77.21, 19.08, 72.88), 1150, delta=25)
+        # Delhi -> Ludhiana is about 290 km.
+        self.assertAlmostEqual(
+            haversine_km(28.61, 77.21, 30.90, 75.85), 290, delta=25)
+        self.assertAlmostEqual(haversine_km(20.0, 78.0, 20.0, 78.0), 0, places=6)
+
+    def test_fire_activity_sums_power_as_well_as_counting(self):
+        """
+        A hundred smouldering detections and a hundred intense ones are the same
+        count and nowhere near the same emission, so FRP has to be carried.
+        """
+        self._store_fires(self._punjab_cluster(n=50))
+        self.assertGreater(self.gold.build_fire_activity_daily(100_000), 0)
+
+        path = os.path.join(self.gold.GOLD_DIR, 'fire_activity_daily',
+                            'date=2024-11-05.parquet')
+        gold = pd.read_parquet(path)
+        row = gold[gold['sensor'] == 'VIIRS_SNPP'].iloc[0]
+        self.assertEqual(row['n_detections'], 50)
+        self.assertEqual(row['n_high_confidence'], 50)
+        self.assertAlmostEqual(row['frp_total_mw'], 500.0, places=1)
+
+    def test_city_exposure_finds_upwind_fires_not_just_local_ones(self):
+        """
+        The point of the distance bands: Delhi has no fires inside it and a lot
+        of burning 300 km away, which is what actually drives its November PM2.5.
+        """
+        self._store_fires(self._punjab_cluster(n=50))
+        self.gold.build_city_fire_exposure_daily(100_000)
+
+        path = os.path.join(self.gold.GOLD_DIR, 'city_fire_exposure_daily',
+                            'date=2024-11-05.parquet')
+        gold = pd.read_parquet(path).set_index('city')
+
+        self.assertIn('delhi', gold.index)
+        delhi = gold.loc['delhi']
+        self.assertEqual(delhi['fires_within_100km'], 0, 'no fires are inside Delhi')
+        self.assertEqual(delhi['fires_within_500km'], 50)
+        self.assertGreater(delhi['frp_within_500km'], 0)
+        self.assertLess(delhi['nearest_fire_km'], 500)
+
+    def test_distant_cities_are_not_credited_with_those_fires(self):
+        self._store_fires(self._punjab_cluster(n=50))
+        self.gold.build_city_fire_exposure_daily(100_000)
+        path = os.path.join(self.gold.GOLD_DIR, 'city_fire_exposure_daily',
+                            'date=2024-11-05.parquet')
+        gold = pd.read_parquet(path).set_index('city')
+        for far in ('chennai', 'bengaluru'):
+            if far in gold.index:
+                self.assertEqual(gold.loc[far, 'fires_within_500km'], 0,
+                                 f'{far} should see no Punjab fires')
+
+    def test_radius_bands_are_nested(self):
+        """A fire within 100 km is necessarily within 300 and 500."""
+        self._store_fires(self._punjab_cluster(n=50))
+        self.gold.build_city_fire_exposure_daily(100_000)
+        path = os.path.join(self.gold.GOLD_DIR, 'city_fire_exposure_daily',
+                            'date=2024-11-05.parquet')
+        for _, row in pd.read_parquet(path).iterrows():
+            self.assertLessEqual(row['fires_within_100km'], row['fires_within_300km'])
+            self.assertLessEqual(row['fires_within_300km'], row['fires_within_500km'])
+            self.assertLessEqual(row['frp_within_100km'], row['frp_within_300km'] + 1e-6)
+
+    def test_the_default_lookback_would_skip_a_historical_backfill(self):
+        """
+        Pins why --all exists. Three days is right for the hourly scheduler and
+        wrong for an archive spanning years; without an override the backfilled
+        data would never reach gold.
+        """
+        self.assertLessEqual(self.gold.GOLD_LOOKBACK_DAYS, 7)
+        self._store_fires(self._punjab_cluster(n=50), day='2020-11-05')
+        self.assertEqual(self.gold.build_fire_activity_daily(3), 0,
+                         'a 2020 partition must fall outside a 3-day window')
+        self.assertGreater(self.gold.build_fire_activity_daily(100_000), 0,
+                           'a wide lookback must pick the same partition up')
+
+    def test_every_builder_accepts_the_lookback_argument(self):
+        """build_all_gold passes it to all of them, so none may reject it."""
+        import inspect
+        for name in ('build_city_aqi_hourly', 'build_gfs_grid_hourly',
+                     'build_city_daily_summary', 'build_fire_activity_daily',
+                     'build_city_fire_exposure_daily'):
+            params = inspect.signature(getattr(self.gold, name)).parameters
+            self.assertIn('lookback_days', params, f'{name} cannot be given a lookback')
