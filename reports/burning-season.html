@@ -2,25 +2,31 @@
   India Burning Season - static report.
 
   Figures are baked into this file, so it is a snapshot, not a live view.
-  Built from the pipeline database on 2026-09-15, covering January, October,
-  November and December of 2020-2025:
+  Built from the pipeline database on 2026-09-15:
 
       1,502,393 FIRMS detections   (backfill_firms.py)
         194,832 weather hours      (backfill_weather.py, 13 stations)
+         88,512 CAMS air quality   (backfill_airquality.py, 8 cities)
 
-  To refresh the numbers after the database changes, re-run:
+  To refresh after the database changes, re-run:
 
-      python analyze_fire_weather.py --station Delhi
-      python analyze_fire_weather.py --station Amritsar
-      python analyze_fire_weather.py --station Patiala
+      python analyze_fire_weather.py --station Delhi|Amritsar|Patiala
 
-  and update the DATA, DAILY, RAIN and RHO constants in the script block below.
-  Open the file directly in a browser - it needs no server and no build step.
+  and update the DATA, DAILY, RAIN, RHO and PM constants in the script block
+  below. Open the file directly in a browser - no server, no build step.
+
+  Two findings the page deliberately does NOT overclaim:
+    - The city PM2.5 correlation is not evidence of smoke transport. Mumbai at
+      1,302 km correlates more strongly than Patiala at 63 km; what the data
+      shows is a shared winter season, not smoke arriving.
+    - CAMS is fed by GFAS, which assimilates MODIS and VIIRS active-fire
+      observations - the same sensors behind the detection counts. Correlating
+      the two is partly circular by construction.
 
   Palette: dataviz categorical slots 1-4, validated for colour-vision deficiency
-  in both light and dark modes. The dumbbell deliberately uses two categorical
-  slots rather than two shades of one hue: the dark-mode lightness band
-  (L 0.48-0.67) is too narrow for two steps of a single hue to stay apart.
+  in both light and dark modes. The dumbbell uses two categorical slots rather
+  than two shades of one hue: the dark-mode lightness band (L 0.48-0.67) is too
+  narrow for two steps of a single hue to stay apart.
 -->
 <title>India Burning Season</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap">
@@ -338,6 +344,48 @@ tfoot td {
       missing. Amritsar&rsquo;s 2022 and 2024 sit near zero &mdash; the signal is directionally
       consistent but not uniformly strong.
     </p>
+  </section>
+
+  <section>
+    <h2>Does the smoke reach the cities?</h2>
+    <p class="sub">
+      The obvious next question, and the data answers it &mdash; just not the way you would
+      hope. Each point is one city: how far it sits from the centre of the burning belt,
+      against how strongly its daily PM2.5 tracks daily belt detections through October
+      and November. If smoke transport drove the relationship, near cities would sit high
+      and far ones low.
+    </p>
+    <div class="figure">
+      <svg id="scatter" viewBox="0 0 860 400" role="img"
+           aria-label="Scatter plot of distance from the burning belt against correlation between city PM2.5 and belt fire detections, for eight cities."></svg>
+    </div>
+    <p class="sub" style="margin-top:14px">
+      It does not hold. <strong>Mumbai, 1,302&nbsp;km away, correlates more strongly than any
+      city in the belt itself</strong> &mdash; more than Patiala at 63&nbsp;km and Amritsar at
+      151&nbsp;km. What the chart actually shows is a north&ndash;south split: the northern
+      cities share a winter season in which both burning and trapped air peak together,
+      while Bengaluru and Chennai, in a different climate, track neither.
+    </p>
+    <p class="sub" style="margin-top:10px">
+      So this is co-occurrence in a season, not smoke arriving somewhere. Mumbai is the
+      control that gives it away, and it is the reason the chart is here rather than a
+      headline about stubble smoke reaching Delhi.
+    </p>
+    <div class="figure" style="border-color:var(--s2); margin-top:20px">
+      <div style="padding:4px 6px 12px">
+        <div class="lg" style="font-weight:500;color:var(--ink);margin-bottom:8px">
+          One more reason not to read this as evidence
+        </div>
+        <p class="sub" style="max-width:74ch;margin:0">
+          The PM2.5 here is CAMS reanalysis, not a ground measurement &mdash; and CAMS is fed
+          by the Global Fire Assimilation System, which ingests
+          <strong>MODIS and VIIRS active-fire observations</strong>: the same two sensors
+          supplying the detection counts on the other axis. The model was told where the
+          fires were. A correlation between the two is partly circular by construction,
+          whatever the geography says.
+        </p>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -691,5 +739,74 @@ const RHO = {
                                  stroke: "var(--ink-3)", "stroke-width": 1 }));
     if (si < names.length - 1) y += gapS;
   });
+})();
+
+/* ---------- distance from the belt vs PM2.5 correlation ---------- */
+const PM = [
+  { city: "patiala",   km: 63,   rho: 0.168 },
+  { city: "amritsar",  km: 151,  rho: 0.209 },
+  { city: "delhi",     km: 253,  rho: 0.318 },
+  { city: "lucknow",   km: 650,  rho: 0.305 },
+  { city: "mumbai",    km: 1302, rho: 0.350 },
+  { city: "kolkata",   km: 1532, rho: 0.187 },
+  { city: "bengaluru", km: 1958, rho: 0.087 },
+  { city: "chennai",   km: 1992, rho: 0.074 }
+];
+(function scatter() {
+  const svg = document.getElementById("scatter");
+  const W = 860, H = 400, L = 66, R = 26, T = 26, B = 58;
+  const iw = W - L - R, ih = H - T - B;
+  const xMax = 2100, yMax = 0.40;
+  const x = v => L + (iw * v) / xMax;
+  const y = v => T + ih - (ih * v) / yMax;
+
+  for (let v = 0; v <= 0.40; v += 0.10) {
+    svg.appendChild(el("line", { x1: L, x2: L + iw, y1: y(v), y2: y(v), class: "gridline" }));
+    const t = el("text", { x: L - 10, y: y(v) + 4, class: "axis-lbl", "text-anchor": "end" });
+    t.textContent = v.toFixed(2);
+    svg.appendChild(t);
+  }
+  [0, 500, 1000, 1500, 2000].forEach(v => {
+    const t = el("text", { x: x(v), y: T + ih + 22, class: "axis-lbl", "text-anchor": "middle" });
+    t.textContent = v === 0 ? "0" : v.toLocaleString("en-US");
+    svg.appendChild(t);
+  });
+  const ax = el("text", { x: L + iw / 2, y: T + ih + 44, class: "smnote", "text-anchor": "middle" });
+  ax.textContent = "kilometres from the centre of the burning belt";
+  svg.appendChild(ax);
+  const ay = el("text", { x: L - 10, y: T - 10, class: "smnote", "text-anchor": "end" });
+  ay.textContent = "rho";
+  svg.appendChild(ay);
+
+  // The belt itself, so "inside" and "outside" are visible rather than implied.
+  const beltEdge = x(200);
+  svg.appendChild(el("rect", { x: L, y: T, width: beltEdge - L, height: ih,
+                               fill: "var(--s2)", opacity: .07 }));
+  const bl = el("text", { x: L + 8, y: T + 14, class: "smnote", fill: "var(--s2)" });
+  bl.textContent = "inside the belt";
+  svg.appendChild(bl);
+
+  PM.forEach(p => {
+    svg.appendChild(el("circle", { cx: x(p.km), cy: y(p.rho), r: 6,
+                                   fill: "var(--s1)", stroke: "var(--surface)", "stroke-width": 2 }));
+    // Nudge the labels that would otherwise collide: lucknow sits just under
+    // delhi, and bengaluru/chennai are 34 km and 0.013 rho apart.
+    const NUDGE = { lucknow: [0, 20], chennai: [0, 22], bengaluru: [0, -15] };
+    const [ddx, ddy] = NUDGE[p.city] || [0, -14];
+    const t = el("text", { x: x(p.km) + ddx, y: y(p.rho) + ddy, class: "dlabel",
+                           fill: "var(--ink-2)", "text-anchor": "middle" });
+    t.textContent = p.city;
+    svg.appendChild(t);
+  });
+
+  // Call out the pair that breaks the transport story.
+  const mum = PM.find(p => p.city === "mumbai"), pat = PM.find(p => p.city === "patiala");
+  svg.appendChild(el("line", { x1: x(pat.km), y1: y(pat.rho), x2: x(mum.km), y2: y(mum.rho),
+                               stroke: "var(--s2)", "stroke-width": 1.5,
+                               "stroke-dasharray": "5 4", opacity: .75 }));
+  const note = el("text", { x: x(760), y: y(0.222), class: "smnote", fill: "var(--s2)",
+                            "text-anchor": "middle" });
+  note.textContent = "farther away, yet correlates more strongly";
+  svg.appendChild(note);
 })();
 </script>
