@@ -381,7 +381,8 @@ figure.
 
 `reports/burning-season.html` presents all of this as a standalone page: detections
 by month year over year, the daily shape of each season, the rain dumbbell across the
-three stations, and the per-year rank correlations. It opens straight in a browser
+three stations, the per-year rank correlations, and the distance-versus-correlation
+scatter below. It opens straight in a browser
 with no server or build step. The figures are baked in, so it is a snapshot rather
 than a live view — the file header records the data state it was built from and which
 commands regenerate the numbers.
@@ -390,6 +391,38 @@ Amritsar and Patiala sit inside the belt, so the analysis no longer has to lean 
 Delhi from 250 km away. Running all three is a useful robustness check rather than a
 choice between them: the rain result holds at every station (ratio 0.14 Delhi, 0.20
 Amritsar, 0.18 Patiala), which is a stronger claim than any single station makes.
+
+### The smoke-transport question, and why the data cannot answer it
+
+With CAMS air quality loaded, the obvious chart is belt fire detections against city
+PM2.5. It is in the report, as a negative result. Correlation of daily PM2.5 with
+daily belt detections, October and November 2022–2025:
+
+| City | km from belt | Spearman ρ |
+|---|---|---|
+| **mumbai** | **1,302** | **+0.350** |
+| delhi | 253 | +0.318 |
+| lucknow | 650 | +0.305 |
+| amritsar | 151 *(in belt)* | +0.209 |
+| kolkata | 1,532 | +0.187 |
+| patiala | 63 *(in belt)* | +0.168 |
+| bengaluru | 1,958 | +0.087 |
+| chennai | 1,992 | +0.074 |
+
+Smoke transport cannot produce that ordering. Mumbai, 1,302 km away, correlates more
+strongly than either city inside the belt. What the column actually measures is a
+north–south split: the northern cities share a winter in which burning and trapped air
+peak together, while Bengaluru and Chennai, in a different climate, track neither.
+Mumbai is the control that gives it away.
+
+There is a second, independent reason the number cannot carry weight. CAMS is fed by
+the Global Fire Assimilation System, which assimilates **MODIS and VIIRS active-fire
+observations** — the same two sensors supplying the detection counts on the other axis.
+The model was told where the fires were, so the correlation is partly circular by
+construction, whatever the geography says.
+
+Answering the transport question properly needs ground-measured PM2.5, which this
+pipeline does not have historically, plus transport modelling it does not do.
 
 ## Data quality control
 
