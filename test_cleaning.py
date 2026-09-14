@@ -108,5 +108,32 @@ class TestQCChain(unittest.TestCase):
         self.assertFalse(df_clean['pm25_imputed'].iloc[0])
         self.assertFalse(df_clean['pm25_imputed'].iloc[2])
 
+class TestGoldAqiScale(unittest.TestCase):
+    """
+    WAQI's iaqi values are AQI sub-indices; CAMS reports ug/m3. gold_layer must
+    not push a sub-index through the concentration breakpoints a second time.
+    """
+
+    def test_subindex_source_is_not_reconverted(self):
+        import gold_layer
+        self.assertEqual(gold_layer._aqi_from(112.0, 60.0, 'cpcb'), 112.0)
+        self.assertEqual(gold_layer.aqi_category(112.0), 'Moderate')
+
+    def test_concentration_source_uses_breakpoints(self):
+        import gold_layer
+        aqi = gold_layer._aqi_from(112.0, 60.0, 'cams-openmeteo-archive')
+        self.assertAlmostEqual(aqi, 273.6, places=1)
+        self.assertEqual(gold_layer.aqi_category(aqi), 'Poor')
+
+    def test_missing_source_defaults_to_subindex(self):
+        import gold_layer
+        # cleaned_cpcb rows predating the source column must not be inflated.
+        self.assertEqual(gold_layer._aqi_from(112.0, 60.0, None), 112.0)
+
+    def test_all_nan_yields_nan(self):
+        import gold_layer
+        self.assertTrue(np.isnan(gold_layer._aqi_from(np.nan, np.nan, 'cpcb')))
+
+
 if __name__ == '__main__':
     unittest.main()

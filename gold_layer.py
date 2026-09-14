@@ -81,6 +81,29 @@ def _circular_mean_deg(series):
     return round(float(np.rad2deg(ang) % 360.0), 6) % 360.0
 
 
+# Sources whose pm25/pm10 columns hold AQI sub-indices rather than ug/m3.
+# WAQI is the live feed behind cleaned_cpcb; anything else is assumed to be a
+# concentration and gets the CPCB breakpoints applied.
+_SUBINDEX_SOURCES = ('cpcb', 'waqi')
+
+
+def _is_subindex(source):
+    return str(source or 'cpcb').strip().lower() in _SUBINDEX_SOURCES
+
+
+def _aqi_from(pm25, pm10, source):
+    """Overall AQI from a pm25/pm10 pair, respecting what scale they are on."""
+    if _is_subindex(source):
+        vals = [v for v in (pm25, pm10) if not pd.isna(v)]
+        return max(vals) if vals else np.nan
+    vals = [v for v in (_pm25_aqi(pm25), _pm10_aqi(pm10)) if not pd.isna(v)]
+    return max(vals) if vals else np.nan
+
+
+def _row_aqi(row):
+    return _aqi_from(row.get('pm25_clean'), row.get('pm10_clean'), row.get('source'))
+
+
 def aqi_category(aqi_val):
     """Map numeric AQI to India CPCB category string."""
     if pd.isna(aqi_val):
@@ -126,10 +149,17 @@ def build_city_aqi_hourly():
     df['hour_bucket'] = df['ts'].dt.floor('h').dt.strftime('%Y-%m-%dT%H:00:00+00:00')
     df['date'] = df['ts'].dt.strftime('%Y-%m-%d')
 
-    # Compute AQI sub-indices
-    df['pm25_aqi'] = df['pm25_clean'].apply(_pm25_aqi)
-    df['pm10_aqi'] = df['pm10_clean'].apply(_pm10_aqi)
-    df['aqi']      = df[['pm25_aqi', 'pm10_aqi']].max(axis=1)
+    # BUGFIX: this used to push pm25_clean through _pm25_aqi unconditionally,
+    # treating it as a concentration. cleaned_cpcb is fed by WAQI, whose `iaqi`
+    # values are ALREADY AQI sub-indices on the 0-500 scale - you can confirm it
+    # from the API itself, where the overall `aqi` equals `iaqi[dominentpol]`
+    # exactly. Mapping a sub-index through the concentration breakpoints a second
+    # time inflated every figure: a reported pm25 of 112 came out as AQI 273.6
+    # ("Poor") when the correct answer was 112 ("Moderate").
+    #
+    # Rows that genuinely hold concentrations (ug/m3) do need the breakpoints, so
+    # decide per row from `source` rather than assuming one or the other.
+    df['aqi'] = df.apply(_row_aqi, axis=1)
 
     # Aggregate per city per hour
     gold = (
@@ -295,6 +325,7 @@ def build_city_daily_summary():
                 co_daily_mean=('co_clean', 'mean'),
                 o3_daily_mean=('o3_clean', 'mean'),
                 n_obs=('timestamp', 'count'),
+                source=('source', lambda x: x.iloc[0] if len(x) else None),
             )
         )
 
@@ -322,13 +353,11 @@ def build_city_daily_summary():
 
         daily_poll.drop(columns='city_key', inplace=True)
 
-        # Compute daily AQI
-        daily_poll['daily_aqi'] = daily_poll[['pm25_daily_mean', 'pm10_daily_mean']].apply(
-            lambda r: max(
-                _pm25_aqi(r['pm25_daily_mean']) if not pd.isna(r['pm25_daily_mean']) else 0,
-                _pm10_aqi(r['pm10_daily_mean']) if not pd.isna(r['pm10_daily_mean']) else 0,
-            ), axis=1
-        )
+        # Daily AQI. Same correction as the hourly path: sub-indices are averaged
+        # directly, concentrations go through the breakpoints first.
+        daily_poll['daily_aqi'] = daily_poll.apply(
+            lambda r: _aqi_from(r['pm25_daily_mean'], r['pm10_daily_mean'], r.get('source')),
+            axis=1)
         daily_poll['daily_aqi_category'] = daily_poll['daily_aqi'].apply(aqi_category)
         daily_poll['computed_at'] = datetime.now(timezone.utc).isoformat()
 

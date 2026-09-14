@@ -210,6 +210,49 @@ class TestDatabaseIdempotency(unittest.TestCase):
         self.cur.execute("SELECT COUNT(*) FROM cleaned_sentinel5p WHERE lat=? AND lon=? AND timestamp=?", (lat, lon, ts))
         self.assertEqual(self.cur.fetchone()[0], 1, "cleaned_sentinel5p duplicated (lat, lon, timestamp)!")
 
+    def test_raw_cams_aq_idempotency(self):
+        city, span = "delhi", "2024-11-01"
+        payload = '{"hourly": {"time": ["2024-11-01T00:00"], "pm2_5": [180.4]}}'
+        p_hash = compute_hash(payload)
+
+        for _ in range(3):
+            self.cur.execute("""
+                INSERT OR IGNORE INTO raw_cams_aq (city, lat, lon, span_start, raw_data, raw_data_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (city, 28.61, 77.21, span, payload, p_hash))
+        self.conn.commit()
+
+        self.cur.execute("SELECT COUNT(*) FROM raw_cams_aq WHERE city=? AND span_start=? AND raw_data_hash=?",
+                         (city, span, p_hash))
+        self.assertEqual(self.cur.fetchone()[0], 1, "raw_cams_aq duplicated (city, span_start, raw_data_hash)!")
+
+    def test_cleaned_cams_aq_idempotency(self):
+        city = "delhi"
+        ts = "2024-11-01T00:00:00+00:00"
+
+        for _ in range(2):
+            self.cur.execute("""
+                INSERT OR IGNORE INTO cleaned_cams_aq (city, lat, lon, timestamp, pm25_ugm3, pm25_clean, pm25_qc_flag)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (city, 28.61, 77.21, ts, 180.4, 180.4, "ok"))
+        self.conn.commit()
+
+        self.cur.execute("SELECT COUNT(*) FROM cleaned_cams_aq WHERE city = ? AND timestamp = ?", (city, ts))
+        self.assertEqual(self.cur.fetchone()[0], 1, "cleaned_cams_aq duplicated (city, timestamp)!")
+
+    def test_cams_aq_kept_separate_from_cpcb(self):
+        """
+        The two tables hold different quantities - WAQI gives AQI sub-indices,
+        CAMS gives ug/m3 - so a CAMS row must never be writable into the CPCB
+        column set by accident. Guard the schemas against being merged later.
+        """
+        cpcb_cols = {r[1] for r in self.cur.execute("PRAGMA table_info(cleaned_cpcb)")}
+        cams_cols = {r[1] for r in self.cur.execute("PRAGMA table_info(cleaned_cams_aq)")}
+        self.assertIn("pm25_raw", cpcb_cols, "cleaned_cpcb should carry pm25_raw (AQI sub-index)")
+        self.assertIn("pm25_ugm3", cams_cols, "cleaned_cams_aq should carry pm25_ugm3 (concentration)")
+        self.assertNotIn("pm25_ugm3", cpcb_cols, "concentration column leaked into cleaned_cpcb")
+        self.assertNotIn("pm25_raw", cams_cols, "sub-index column leaked into cleaned_cams_aq")
+
     def test_gfs_compute_valid_time(self):
         from fetch_gfs import compute_valid_time
         # Test 00Z cycle + 003 fhr

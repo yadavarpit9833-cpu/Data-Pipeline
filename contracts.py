@@ -94,11 +94,37 @@ def _build_firms_schema():
     )
 
 
+def _build_cams_aq_schema():
+    """
+    CAMS concentrations in the source's own units (ug/m3 throughout, CO
+    included). Ranges are generous because this is model output over Indian
+    cities during burning season, where PM2.5 genuinely reaches the high
+    hundreds.
+    """
+    return DataFrameSchema(
+        columns={
+            "city":      Column(str, nullable=False),
+            "timestamp": Column(str, nullable=False),
+            "pm25_ugm3": Column(float, checks=Check.in_range(0, 2000),  nullable=True),
+            "pm10_ugm3": Column(float, checks=Check.in_range(0, 3000),  nullable=True),
+            "no2_ugm3":  Column(float, checks=Check.in_range(0, 1000),  nullable=True),
+            "so2_ugm3":  Column(float, checks=Check.in_range(0, 1000),  nullable=True),
+            "co_ugm3":   Column(float, checks=Check.in_range(0, 50000), nullable=True),
+            "o3_ugm3":   Column(float, checks=Check.in_range(0, 1000),  nullable=True),
+            "source":    Column(str, nullable=False),
+            "is_synthetic": Column(int, checks=Check.isin([0, 1]), nullable=False),
+        },
+        coerce=True,
+        name="cleaned_cams_aq",
+    )
+
+
 _SCHEMAS = {
     'cpcb':    _build_cpcb_schema,
     'weather': _build_weather_schema,
     'gfs':     _build_gfs_schema,
     'firms':   _build_firms_schema,
+    'cams_aq': _build_cams_aq_schema,
 }
 
 

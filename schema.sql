@@ -213,6 +213,43 @@ CREATE TABLE IF NOT EXISTS cleaned_sentinel5p (
     CONSTRAINT unq_cleaned_sentinel5p UNIQUE (lat, lon, timestamp)
 );
 
+-- CAMS air quality. Deliberately NOT stored in cleaned_cpcb: WAQI's iaqi values
+-- are AQI sub-indices on a 0-500 scale, while CAMS reports physical
+-- concentrations. Putting both in one column would make that column ambiguous
+-- without inspecting `source` on every row. Units are CAMS's own, as fetched:
+-- ug/m3 for every pollutant including CO (CPCB quotes CO in mg/m3 instead).
+CREATE TABLE IF NOT EXISTS raw_cams_aq (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    city TEXT,
+    lat REAL,
+    lon REAL,
+    span_start TEXT,
+    raw_data TEXT,
+    raw_data_hash TEXT,
+    source TEXT DEFAULT 'cams-openmeteo-archive',
+    is_synthetic INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unq_raw_cams_aq UNIQUE (city, span_start, raw_data_hash)
+);
+
+CREATE TABLE IF NOT EXISTS cleaned_cams_aq (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    city TEXT,
+    lat REAL,
+    lon REAL,
+    timestamp TEXT,
+    pm25_ugm3 REAL, pm25_clean REAL, pm25_imputed INTEGER DEFAULT 0, pm25_qc_flag TEXT DEFAULT 'ok',
+    pm10_ugm3 REAL, pm10_clean REAL, pm10_imputed INTEGER DEFAULT 0, pm10_qc_flag TEXT DEFAULT 'ok',
+    no2_ugm3 REAL,  no2_clean REAL,  no2_imputed INTEGER DEFAULT 0,  no2_qc_flag TEXT DEFAULT 'ok',
+    so2_ugm3 REAL,  so2_clean REAL,  so2_imputed INTEGER DEFAULT 0,  so2_qc_flag TEXT DEFAULT 'ok',
+    co_ugm3 REAL,   co_clean REAL,   co_imputed INTEGER DEFAULT 0,   co_qc_flag TEXT DEFAULT 'ok',
+    o3_ugm3 REAL,   o3_clean REAL,   o3_imputed INTEGER DEFAULT 0,   o3_qc_flag TEXT DEFAULT 'ok',
+    source TEXT DEFAULT 'cams-openmeteo-archive',
+    is_synthetic INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unq_cleaned_cams_aq UNIQUE (city, timestamp)
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_run_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,

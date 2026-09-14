@@ -94,7 +94,7 @@ so the two can never disagree:
 
 | city | pm25_mean | aqi_max | aqi_category | n_stations |
 |---|---|---|---|---|
-| delhi | 112.0 | 273.6 | Poor | 1 |
+| delhi | 112.0 | 112.0 | Moderate | 1 |
 
 Also carries `hour_bucket`, `pm10_mean`, `no2_mean` and `computed_at`.
 
@@ -104,7 +104,12 @@ is a circular mean, and `n_weather_obs` shows how many weather rows backed the j
 
 | city | daily_aqi | daily_aqi_category | temp_daily_mean | wind_dir_daily_mean | n_weather_obs |
 |---|---|---|---|---|---|
-| delhi | 273.6 | Poor | 28.32 | 106.4 | 5 |
+| delhi | 97.0 | Satisfactory | 28.32 | 106.4 | 5 |
+
+The weather columns are null on any city-day the join finds no matching station,
+which is the LEFT join doing its job rather than a fault — a CPCB observation
+timestamped just past midnight UTC will sit in a date partition the weather side
+has not reached yet.
 
 Also carries the six `*_daily_mean` pollutant columns, `humidity_daily_mean`,
 `rainfall_daily_total`, `temp_daily_max/min`, `wind_speed_daily_mean` and `n_obs`.
@@ -316,6 +321,32 @@ failures for the original 11 stations — 11 × 123 days × 24 hours × 6 years.
 Amritsar and Patiala were added afterwards and loaded with `--stations`, another
 35,424 rows.
 
+### Air quality — `backfill_airquality.py`
+
+```bash
+python backfill_airquality.py                  # Oct 2022 onward, 8 cities
+python backfill_airquality.py --cities delhi amritsar
+python backfill_airquality.py --dry-run
+```
+
+Two things to know before using what it writes.
+
+**It is not CPCB ground-station data.** CPCB observations are not available
+historically through any free interface — the WAQI API behind `fetch_cpcb.py`
+serves the current observation only, and CPCB's own archive is not openly
+published. This loads the CAMS atmospheric composition reanalysis via Open-Meteo
+instead: a model product, not a measurement.
+
+**Coverage starts 2022-08-03.** Earlier dates return rows of nulls rather than an
+error, so the floor is enforced in the script. Of the 24-month window the fire and
+weather backfills cover, this fills 15 — October 2022 onward. 2020, 2021 and
+January 2022 cannot be filled from here.
+
+Rows go to `cleaned_cams_aq`, deliberately not to `cleaned_cpcb`, because the two
+hold different quantities: WAQI gives AQI sub-indices, CAMS gives concentrations.
+Units are CAMS's own throughout — µg/m³ including CO, where CPCB quotes mg/m³, so
+divide by 1000 before comparing.
+
 ## Analysis
 
 `analyze_fire_weather.py` joins daily FIRMS detections inside a lat/lon box to one
@@ -386,6 +417,13 @@ Amritsar, 0.18 Patiala), which is a stronger claim than any single station makes
 - **AQI category is derived from the aggregate it labels.** `aqi_category` is computed
   from the aggregated `aqi_max`, not reduced from per-station categories — a mode over
   per-station labels can contradict the max it sits beside.
+- **AQI is computed on the scale the row is actually on.** WAQI's `iaqi` values,
+  which feed `cleaned_cpcb`, are already AQI sub-indices on the 0–500 scale — the
+  API's overall `aqi` equals `iaqi[dominentpol]` exactly, which is how you can tell.
+  Pushing one of those through the CPCB concentration breakpoints a second time
+  inflates it badly: a reported pm25 of 112 becomes AQI 273.6 ("Poor") when the
+  correct answer is 112 ("Moderate"). Rows that genuinely hold µg/m³ do need the
+  breakpoints, so `gold_layer` decides per row from `source`.
 - **Wind direction averages circularly.** The daily mean bearing uses a vector mean; an
   arithmetic mean of 350° and 10° gives 180° (due south) when the answer is 0° (north).
 - **The daily summary join is a LEFT join.** A city with pollution data but no matching
@@ -429,6 +467,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `inspect_firms.py` | FIRMS entries and duplicate check |
 | `backfill_firms.py` | Load historical FIRMS fires from the SP archives |
 | `backfill_weather.py` | Load historical weather from the Open-Meteo archive |
+| `backfill_airquality.py` | Load historical CAMS air quality into `cleaned_cams_aq` |
 | `analyze_fire_weather.py` | Correlate belt fire counts against station weather |
 | `reports/burning-season.html` | Standalone report page built from the two backfills |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
