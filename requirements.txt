@@ -7,7 +7,6 @@ psycopg2-binary
 python-dotenv
 cfgrib
 xarray
-sqlalchemy
 pandera
 duckdb
 pyarrow

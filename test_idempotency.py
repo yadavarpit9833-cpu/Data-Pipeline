@@ -182,6 +182,34 @@ class TestDatabaseIdempotency(unittest.TestCase):
         self.cur.execute("SELECT COUNT(*) FROM cleaned_firms WHERE lat=? AND lon=? AND timestamp=? AND satellite=?", (lat, lon, ts, sat))
         self.assertEqual(self.cur.fetchone()[0], 1, "cleaned_firms duplicated (lat, lon, timestamp, satellite)!")
 
+    def test_raw_sentinel5p_idempotency(self):
+        lat, lon = 28.5, 77.2
+        ts = "2026-09-09T00:00:00+00:00"
+
+        for _ in range(3):
+            self.cur.execute("""
+                INSERT OR IGNORE INTO raw_sentinel5p (lat, lon, timestamp, no2_ppb, so2_ppb, co_ppb, o3_ppb, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (lat, lon, ts, 12.5, 3.1, 180.0, 45.0, "2026-09-09T06:15:00+00:00"))
+        self.conn.commit()
+
+        self.cur.execute("SELECT COUNT(*) FROM raw_sentinel5p WHERE lat=? AND lon=? AND timestamp=?", (lat, lon, ts))
+        self.assertEqual(self.cur.fetchone()[0], 1, "raw_sentinel5p duplicated identical (lat, lon, timestamp)!")
+
+    def test_cleaned_sentinel5p_idempotency(self):
+        lat, lon = 28.5, 77.2
+        ts = "2026-09-09T00:00:00+00:00"
+
+        for _ in range(2):
+            self.cur.execute("""
+                INSERT OR IGNORE INTO cleaned_sentinel5p (lat, lon, timestamp, no2_ppb, no2_clean, no2_qc_flag)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (lat, lon, ts, 12.5, 12.5, "ok"))
+        self.conn.commit()
+
+        self.cur.execute("SELECT COUNT(*) FROM cleaned_sentinel5p WHERE lat=? AND lon=? AND timestamp=?", (lat, lon, ts))
+        self.assertEqual(self.cur.fetchone()[0], 1, "cleaned_sentinel5p duplicated (lat, lon, timestamp)!")
+
     def test_gfs_compute_valid_time(self):
         from fetch_gfs import compute_valid_time
         # Test 00Z cycle + 003 fhr

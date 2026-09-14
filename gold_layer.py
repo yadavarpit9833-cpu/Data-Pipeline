@@ -67,6 +67,20 @@ def _pm10_aqi(c):
             return ((Ihi - Ilo) / (Chi - Clo)) * (c - Clo) + Ilo
     return 500.0
 
+def _circular_mean_deg(series):
+    """
+    Vector mean of compass bearings. A plain arithmetic mean is wrong here:
+    mean(350, 10) is 180 (due south) when the true mean bearing is 0 (north).
+    """
+    vals = pd.to_numeric(series, errors='coerce').dropna()
+    if vals.empty:
+        return np.nan
+    rad = np.deg2rad(vals.to_numpy(dtype=float))
+    ang = np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())
+    # Snap float residue so due north reads 0.0, not 359.99999999999994
+    return round(float(np.rad2deg(ang) % 360.0), 6) % 360.0
+
+
 def aqi_category(aqi_val):
     """Map numeric AQI to India CPCB category string."""
     if pd.isna(aqi_val):
@@ -116,7 +130,6 @@ def build_city_aqi_hourly():
     df['pm25_aqi'] = df['pm25_clean'].apply(_pm25_aqi)
     df['pm10_aqi'] = df['pm10_clean'].apply(_pm10_aqi)
     df['aqi']      = df[['pm25_aqi', 'pm10_aqi']].max(axis=1)
-    df['aqi_category'] = df['aqi'].apply(aqi_category)
 
     # Aggregate per city per hour
     gold = (
@@ -126,10 +139,14 @@ def build_city_aqi_hourly():
             pm10_mean=('pm10_clean', 'mean'),
             no2_mean=('no2_clean', 'mean'),
             aqi_max=('aqi', 'max'),
-            aqi_category=('aqi_category', lambda x: x.mode().iloc[0] if len(x) else 'unknown'),
             n_stations=('station_id', 'nunique'),
         )
     )
+    # BUGFIX: aqi_category used to be computed per-station and then reduced with
+    # .mode(), while aqi_max is a max — so a city-hour could report aqi_max=300
+    # ("Poor") alongside aqi_category="Moderate", and .mode() broke ties
+    # alphabetically. Derive the label from the aggregate it describes.
+    gold['aqi_category'] = gold['aqi_max'].apply(aqi_category)
     gold['computed_at'] = datetime.now(timezone.utc).isoformat()
 
     # Save partitioned by date
@@ -195,57 +212,134 @@ def build_gfs_grid_hourly():
 
 # ── Gold 3: Daily city summary ───────────────────────────────────────────────
 
+# Weather feature columns, declared once so the output schema stays identical
+# whether or not weather data happened to be available for a given run.
+_WEATHER_FEATURES = [
+    'temp_daily_mean', 'temp_daily_max', 'temp_daily_min',
+    'humidity_daily_mean', 'rainfall_daily_total',
+    'wind_speed_daily_mean', 'wind_dir_daily_mean', 'n_weather_obs',
+]
+
+
+def _load_daily_weather(conn, weather_dir):
+    """
+    Aggregates Silver cleaned_weather to one row per city per day.
+    Returns None when no weather Parquet exists yet.
+    """
+    if not os.path.exists(weather_dir) or not os.listdir(weather_dir):
+        return None
+
+    w_df = conn.execute(f"SELECT * FROM '{weather_dir}/*.parquet'").fetchdf()
+    if w_df.empty:
+        return None
+
+    w_df = w_df[w_df['is_synthetic'] == 0].copy()
+    w_df['ts'] = pd.to_datetime(w_df['timestamp'], utc=True, errors='coerce')
+    w_df.dropna(subset=['ts'], inplace=True)
+    w_df['date'] = w_df['ts'].dt.strftime('%Y-%m-%d')
+    # cleaned_weather keys on 'station' ("Delhi"); cleaned_cpcb on 'city'
+    # ("delhi"). Case-fold both so the join actually matches.
+    w_df['city_key'] = w_df['station'].astype(str).str.strip().str.lower()
+
+    daily_wx = (
+        w_df.groupby(['city_key', 'date'], as_index=False)
+        .agg(
+            temp_daily_mean=('temperature_clean', 'mean'),
+            temp_daily_max=('temperature_clean', 'max'),
+            temp_daily_min=('temperature_clean', 'min'),
+            humidity_daily_mean=('humidity_clean', 'mean'),
+            rainfall_daily_total=('rainfall_clean', 'sum'),
+            wind_speed_daily_mean=('wind_speed_clean', 'mean'),
+            wind_dir_daily_mean=('wind_dir_clean', _circular_mean_deg),
+            n_weather_obs=('timestamp', 'count'),
+        )
+    )
+    return daily_wx
+
+
 def build_city_daily_summary():
     """
-    Joins cleaned_cpcb + cleaned_imd on city+date and produces
+    Joins cleaned_cpcb + cleaned_weather on city+date and produces
     a combined daily feature row per city: avg pollutants + avg weather.
+
+    The join is a LEFT join on the case-folded city name, so a city with
+    pollution data but no weather station still produces a row (weather
+    columns NaN) rather than silently vanishing from the Gold table.
 
     Output: gold/city_daily_summary/date=YYYY-MM-DD.parquet
     """
     cpcb_dir    = os.path.join(DATA_DIR, 'cleaned_cpcb')
     weather_dir = os.path.join(DATA_DIR, 'cleaned_weather')
 
-    conn = _duckdb().connect()
-
     if not os.path.exists(cpcb_dir) or not os.listdir(cpcb_dir):
         logger.warning("[gold] No cleaned_cpcb data for daily summary. Skipping.")
         return 0
 
-    cpcb_df = conn.execute(f"SELECT * FROM '{cpcb_dir}/*.parquet'").fetchdf()
-    cpcb_df = cpcb_df[cpcb_df['is_synthetic'] == 0].copy()
-    cpcb_df['ts']   = pd.to_datetime(cpcb_df['timestamp'], utc=True, errors='coerce')
-    cpcb_df['date'] = cpcb_df['ts'].dt.strftime('%Y-%m-%d')
+    # BUGFIX: the connection used to be opened before the guard above and leaked
+    # on every early return. Open it after the guard and always close it.
+    conn = _duckdb().connect()
+    try:
+        cpcb_df = conn.execute(f"SELECT * FROM '{cpcb_dir}/*.parquet'").fetchdf()
+        cpcb_df = cpcb_df[cpcb_df['is_synthetic'] == 0].copy()
+        cpcb_df['ts']   = pd.to_datetime(cpcb_df['timestamp'], utc=True, errors='coerce')
+        cpcb_df.dropna(subset=['ts'], inplace=True)
+        cpcb_df['date'] = cpcb_df['ts'].dt.strftime('%Y-%m-%d')
 
-    daily_poll = (
-        cpcb_df.groupby(['city', 'date'], as_index=False)
-        .agg(
-            pm25_daily_mean=('pm25_clean', 'mean'),
-            pm10_daily_mean=('pm10_clean', 'mean'),
-            no2_daily_mean=('no2_clean', 'mean'),
-            so2_daily_mean=('so2_clean', 'mean'),
-            co_daily_mean=('co_clean', 'mean'),
-            o3_daily_mean=('o3_clean', 'mean'),
-            n_obs=('timestamp', 'count'),
+        daily_poll = (
+            cpcb_df.groupby(['city', 'date'], as_index=False)
+            .agg(
+                pm25_daily_mean=('pm25_clean', 'mean'),
+                pm10_daily_mean=('pm10_clean', 'mean'),
+                no2_daily_mean=('no2_clean', 'mean'),
+                so2_daily_mean=('so2_clean', 'mean'),
+                co_daily_mean=('co_clean', 'mean'),
+                o3_daily_mean=('o3_clean', 'mean'),
+                n_obs=('timestamp', 'count'),
+            )
         )
-    )
 
-    # Compute daily AQI
-    daily_poll['daily_aqi'] = daily_poll[['pm25_daily_mean', 'pm10_daily_mean']].apply(
-        lambda r: max(
-            _pm25_aqi(r['pm25_daily_mean']) if not pd.isna(r['pm25_daily_mean']) else 0,
-            _pm10_aqi(r['pm10_daily_mean']) if not pd.isna(r['pm10_daily_mean']) else 0,
-        ), axis=1
-    )
-    daily_poll['daily_aqi_category'] = daily_poll['daily_aqi'].apply(aqi_category)
-    daily_poll['computed_at'] = datetime.now(timezone.utc).isoformat()
+        # BUGFIX: weather_dir was computed and never used — the docstring
+        # promised a pollutant+weather row but only pollutants were ever
+        # written. Actually join the weather features now.
+        daily_poll['city_key'] = daily_poll['city'].astype(str).str.strip().str.lower()
+        daily_wx = _load_daily_weather(conn, weather_dir)
 
-    out_dir = os.path.join(GOLD_DIR, 'city_daily_summary')
-    ensure_dir(out_dir)
-    for date_val, group in daily_poll.groupby('date'):
-        path = os.path.join(out_dir, f"date={date_val}.parquet")
-        group.to_parquet(path, index=False)
+        if daily_wx is None:
+            logger.warning("[gold] No cleaned_weather data — weather features will be null.")
+            for col in _WEATHER_FEATURES:
+                daily_poll[col] = np.nan
+        else:
+            daily_poll = daily_poll.merge(daily_wx, on=['city_key', 'date'], how='left')
+            # Guarantee a stable schema even if a column dropped out upstream
+            for col in _WEATHER_FEATURES:
+                if col not in daily_poll.columns:
+                    daily_poll[col] = np.nan
+            matched = int(daily_poll['n_weather_obs'].notna().sum())
+            logger.info(
+                f"[gold] city_daily_summary: matched weather for "
+                f"{matched}/{len(daily_poll)} city-days."
+            )
 
-    conn.close()
+        daily_poll.drop(columns='city_key', inplace=True)
+
+        # Compute daily AQI
+        daily_poll['daily_aqi'] = daily_poll[['pm25_daily_mean', 'pm10_daily_mean']].apply(
+            lambda r: max(
+                _pm25_aqi(r['pm25_daily_mean']) if not pd.isna(r['pm25_daily_mean']) else 0,
+                _pm10_aqi(r['pm10_daily_mean']) if not pd.isna(r['pm10_daily_mean']) else 0,
+            ), axis=1
+        )
+        daily_poll['daily_aqi_category'] = daily_poll['daily_aqi'].apply(aqi_category)
+        daily_poll['computed_at'] = datetime.now(timezone.utc).isoformat()
+
+        out_dir = os.path.join(GOLD_DIR, 'city_daily_summary')
+        ensure_dir(out_dir)
+        for date_val, group in daily_poll.groupby('date'):
+            path = os.path.join(out_dir, f"date={date_val}.parquet")
+            group.to_parquet(path, index=False)
+    finally:
+        conn.close()
+
     logger.info(f"[gold] city_daily_summary: {len(daily_poll)} rows.")
     return len(daily_poll)
 

@@ -170,6 +170,49 @@ CREATE TABLE IF NOT EXISTS cleaned_firms (
     CONSTRAINT unq_cleaned_firms UNIQUE (lat, lon, timestamp, satellite)
 );
 
+-- Note: Sentinel-5P rows are sourced from the CAMS/Open-Meteo composite, not
+-- direct TROPOMI L2 granules. Unique on the grid cell + observation timestamp.
+CREATE TABLE IF NOT EXISTS raw_sentinel5p (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lat REAL,
+    lon REAL,
+    timestamp TEXT,
+    no2_ppb REAL,
+    so2_ppb REAL,
+    co_ppb REAL,
+    o3_ppb REAL,
+    fetched_at TEXT,
+    raw_data_hash TEXT,
+    source TEXT DEFAULT 'cams_open-meteo',
+    is_synthetic INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unq_sentinel5p UNIQUE (lat, lon, timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS cleaned_sentinel5p (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lat REAL,
+    lon REAL,
+    timestamp TEXT,
+    no2_ppb REAL,
+    no2_clean REAL,
+    no2_qc_flag TEXT DEFAULT 'ok',
+    so2_ppb REAL,
+    so2_clean REAL,
+    so2_qc_flag TEXT DEFAULT 'ok',
+    co_ppb REAL,
+    co_clean REAL,
+    co_qc_flag TEXT DEFAULT 'ok',
+    o3_ppb REAL,
+    o3_clean REAL,
+    o3_qc_flag TEXT DEFAULT 'ok',
+    fetched_at TEXT,
+    source TEXT DEFAULT 'cams_open-meteo',
+    is_synthetic INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unq_cleaned_sentinel5p UNIQUE (lat, lon, timestamp)
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_run_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,

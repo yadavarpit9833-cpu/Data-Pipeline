@@ -2,17 +2,25 @@
 monitor_health.py — Real-Time Data Pipeline Health & Stability Reporter
 Usage: python monitor_health.py
 """
+import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
-DB_PATH = 'env_data.db'
+# Anchored to this file, not the caller's cwd: check_task_alive.ps1 registers
+# this without a -WorkingDirectory, so a bare relative path silently opened an
+# empty database and reported every source as dead.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'env_data.db')
 
-# Expected run intervals (minutes) and 2x freshness thresholds (minutes)
+# Expected run intervals (minutes) and 2x freshness thresholds (minutes).
+# Every source_key the scheduler writes to pipeline_run_log must appear here,
+# or its job runs and logs but never shows up in the health report.
 SOURCES = {
     'cpcb':  {'name': 'CPCB Air Quality', 'interval': 15,  'threshold': 30},
     'firms': {'name': 'FIRMS Active Fires', 'interval': 20,  'threshold': 40},
     'weather': {'name': 'Open-Meteo Weather', 'interval': 60,  'threshold': 120},
     'gfs':   {'name': 'GFS Grid Forecast', 'interval': 360, 'threshold': 720},
+    'sentinel5p': {'name': 'Sentinel-5P TROPOMI', 'interval': 1440, 'threshold': 2880},
+    'gold':  {'name': 'Medallion Gold Layer', 'interval': 60,  'threshold': 120},
 }
 
 def parse_iso(ts_str):

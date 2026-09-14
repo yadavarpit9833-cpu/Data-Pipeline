@@ -107,60 +107,9 @@ def fetch_tropomi_openmeteo_no2(lat_min, lat_max, lon_min, lon_max, date_str):
     return rows
 
 
-def ensure_sentinel5p_table():
-    """Create the raw and cleaned Sentinel-5P tables if they don't exist."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS raw_sentinel5p (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lat REAL,
-            lon REAL,
-            timestamp TEXT,
-            no2_ppb REAL,
-            so2_ppb REAL,
-            co_ppb REAL,
-            o3_ppb REAL,
-            fetched_at TEXT,
-            raw_data_hash TEXT,
-            source TEXT DEFAULT 'cams_open-meteo',
-            is_synthetic INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT unq_sentinel5p UNIQUE (lat, lon, timestamp)
-        );
-
-        CREATE TABLE IF NOT EXISTS cleaned_sentinel5p (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lat REAL,
-            lon REAL,
-            timestamp TEXT,
-            no2_ppb REAL,
-            no2_clean REAL,
-            no2_qc_flag TEXT DEFAULT 'ok',
-            so2_ppb REAL,
-            so2_clean REAL,
-            so2_qc_flag TEXT DEFAULT 'ok',
-            co_ppb REAL,
-            co_clean REAL,
-            co_qc_flag TEXT DEFAULT 'ok',
-            o3_ppb REAL,
-            o3_clean REAL,
-            o3_qc_flag TEXT DEFAULT 'ok',
-            fetched_at TEXT,
-            source TEXT DEFAULT 'cams_open-meteo',
-            is_synthetic INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT unq_cleaned_sentinel5p UNIQUE (lat, lon, timestamp)
-        );
-    """)
-    conn.commit()
-    conn.close()
-
-
 def main():
     logger.info("Starting Sentinel-5P / CAMS satellite layer fetch...")
-    init_db()
-    ensure_sentinel5p_table()
+    init_db()  # schema.sql now owns the sentinel5p DDL
 
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     rows = fetch_tropomi_openmeteo_no2(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, today)

@@ -4,8 +4,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# BUGFIX: schema.sql and env_data.db were resolved against the *caller's* cwd.
+# The scheduled task launches scheduler.py from a different working directory,
+# so init_db() raised "schema.sql not found." on every job and pipeline_run_log
+# never existed. Anchor both to this module's directory instead, the way
+# scheduler.py and storage.py already do.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _resolve(path):
+    """Absolute paths pass through; relative ones anchor to the repo root."""
+    return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+
 DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite').lower()
-SQLITE_DB_PATH = os.getenv('SQLITE_DB_PATH', 'env_data.db')
+SQLITE_DB_PATH = _resolve(os.getenv('SQLITE_DB_PATH', 'env_data.db'))
 
 def get_db_connection():
     """
@@ -46,6 +57,7 @@ def execute_query(cursor, query, params=()):
 
 def init_db(schema_file='schema.sql'):
     """Applies schema.sql to the database."""
+    schema_file = _resolve(schema_file)
     if not os.path.exists(schema_file):
         raise FileNotFoundError(f"{schema_file} not found.")
         
