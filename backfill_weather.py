@@ -7,13 +7,14 @@ loads the reanalysis archive instead, which reaches back to 1940 and needs no
 API key.
 
 Defaults to the same window as backfill_firms.py — January, October, November
-and December of 2020-2025, across the same 11 stations the live fetcher polls —
+and December of 2020-2025, across the same stations the live fetcher polls —
 so fire and weather line up hour for hour and can actually be correlated.
 
 Usage:
     python backfill_weather.py                     # the default window
     python backfill_weather.py --years 2023 2024
     python backfill_weather.py --months 10 11
+    python backfill_weather.py --stations Amritsar Patiala   # just these stations
     python backfill_weather.py --dry-run
 
 Safe to re-run: inserts are idempotent on (station, timestamp), the same key the
@@ -225,15 +226,27 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--years', nargs='+', type=int, default=DEFAULT_YEARS)
     ap.add_argument('--months', nargs='+', type=int, default=DEFAULT_MONTHS)
+    ap.add_argument('--stations', nargs='+', default=None,
+                    help='station names to load; default is every station in INDIA_STATIONS')
     ap.add_argument('--sleep', type=float, default=0.3)
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
     init_db()
+
+    stations = dict(INDIA_STATIONS)
+    if args.stations:
+        want = {n.lower() for n in args.stations}
+        stations = {w: v for w, v in stations.items() if v[0].lower() in want}
+        missing = want - {v[0].lower() for v in INDIA_STATIONS.values()}
+        if missing:
+            logger.error(f"Unknown station(s): {sorted(missing)}. "
+                         f"Known: {sorted(v[0] for v in INDIA_STATIONS.values())}")
+            return 1
     years = sorted(args.years)
     plan = [(y, s, e) for y in years for (s, e) in contiguous_spans(y, args.months)]
-    n_req = len(plan) * len(INDIA_STATIONS)
-    logger.info(f"Plan: {len(INDIA_STATIONS)} stations x {len(plan)} spans = {n_req} requests")
+    n_req = len(plan) * len(stations)
+    logger.info(f"Plan: {len(stations)} stations x {len(plan)} spans = {n_req} requests")
     for (y, s, e) in plan:
         logger.info(f"  span {s} .. {e}")
     if args.dry_run:
@@ -242,7 +255,7 @@ def main():
     grand = fails = 0
     for (y, start, end) in plan:
         frames = []
-        for wmo, (name, lat, lon) in INDIA_STATIONS.items():
+        for wmo, (name, lat, lon) in stations.items():
             raw = fetch_span(lat, lon, start, end)
             time.sleep(args.sleep)
             if not raw:

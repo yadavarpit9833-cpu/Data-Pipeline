@@ -300,7 +300,7 @@ python backfill_weather.py --years 2023 2024
 python backfill_weather.py --dry-run
 ```
 
-It polls the same 11 stations as `fetch_weather.py` and applies the same QC
+It polls the same 13 stations as `fetch_weather.py` and applies the same QC
 thresholds, including the circular check on wind direction.
 
 **`wind_speed_unit=ms` is not optional.** Open-Meteo returns km/h by default while
@@ -312,7 +312,9 @@ rather than three: 132 requests against the 324 the FIRMS backfill needs, becaus
 the archive endpoint takes a date range where the FIRMS area API caps at five days.
 
 Measured: 194,832 rows for the default window in about five minutes, zero contract
-failures — 11 stations × 123 days × 24 hours × 6 years.
+failures for the original 11 stations — 11 × 123 days × 24 hours × 6 years.
+Amritsar and Patiala were added afterwards and loaded with `--stations`, another
+35,424 rows.
 
 ## Analysis
 
@@ -344,8 +346,10 @@ whether any number it prints means anything:
 The strongest signal in the default window is rain: median 45 detections the day
 after rain against 318 after a dry day, a ratio of 0.14.
 
-One structural caveat — the station list has nothing in Punjab, so Delhi stands in
-at roughly 250 km from the belt.
+Amritsar and Patiala sit inside the belt, so the analysis no longer has to lean on
+Delhi from 250 km away. Running all three is a useful robustness check rather than a
+choice between them: the rain result holds at every station (ratio 0.14 Delhi, 0.20
+Amritsar, 0.18 Patiala), which is a stronger claim than any single station makes.
 
 ## Data quality control
 

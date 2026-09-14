@@ -55,10 +55,17 @@ INDIA_STATIONS = {
     '43295': ('Bengaluru',   12.97, 77.58),
     '42807': ('Kolkata',     22.65, 88.45),
     '43003': ('Mumbai',      19.12, 72.85),
+    # Punjab stations, inside the stubble belt (29-32N, 74-77.5E). Delhi was the
+    # nearest station to the belt and sits ~250 km away, which made it a poor
+    # stand-in for burning-season analysis. WMO IDs verified against WMO RBSN
+    # records; Hisar and Ludhiana are deliberately absent because their IDs could
+    # not be confirmed, and station_id is stored and reserved for the IMD API.
+    '42071': ('Amritsar',    31.63, 74.87),
+    '42101': ('Patiala',     30.34, 76.38),
 }
 
 # Ensure station list is valid: 11 distinct stations expected
-assert len(INDIA_STATIONS) == 11, f"Expected 11 unique stations in INDIA_STATIONS, but found {len(INDIA_STATIONS)}. Check for duplicate WMO IDs."
+assert len(INDIA_STATIONS) == 13, f"Expected 13 unique stations in INDIA_STATIONS, but found {len(INDIA_STATIONS)}. Check for duplicate WMO IDs."
 assert len(set(INDIA_STATIONS.values())) == len(INDIA_STATIONS.values()), "Duplicate station name found in INDIA_STATIONS — check for a name mapped to the wrong ID."
 
 import hashlib
