@@ -42,7 +42,13 @@ def save_raw_data(source, timestamp_str, payload, ext='json'):
         
         if not os.path.exists(file_path):
             mode = 'wb' if ext == 'bin' or isinstance(payload, bytes) else 'w'
-            with open(file_path, mode) as f:
+            # BUGFIX: text mode was opened without an encoding, so it inherited the
+            # platform default - cp1252 on Windows - and any payload containing a
+            # non-Latin-1 character was dropped with "'charmap' codec can't encode".
+            # API responses carry these routinely: CAMS reports units as ug/m3 with
+            # a Greek mu. The raw layer exists to preserve payloads verbatim, so it
+            # must not depend on the console's codepage.
+            with open(file_path, mode, **({} if mode == 'wb' else {'encoding': 'utf-8'})) as f:
                 if mode == 'wb':
                     f.write(payload if isinstance(payload, bytes) else payload.encode('utf-8'))
                 else:
