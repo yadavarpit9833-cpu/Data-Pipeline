@@ -26,13 +26,22 @@ for _stream in (sys.stdout, sys.stderr):
 
 # Setup logging
 log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.log")
+
+# BUGFIX: under pythonw.exe (headless, no console) sys.stdout and sys.stderr are
+# None. A bare logging.StreamHandler() binds to sys.stderr at construction, so it
+# would bind to None and blow up on every record. Attach a console handler only
+# when a real stream exists; the FileHandler keeps scheduler.log complete either
+# way. The task runs headless because python.exe allocates a console that the
+# logon sequence tears down, killing the scheduler with 0xC000013A.
+_handlers = [logging.FileHandler(log_file_path, encoding='utf-8')]
+_console = sys.stderr if sys.stderr is not None else sys.stdout
+if _console is not None:
+    _handlers.append(logging.StreamHandler(_console))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file_path, encoding='utf-8'),
-        logging.StreamHandler()
-    ],
+    handlers=_handlers,
     force=True
 )
 logger = logging.getLogger('scheduler')

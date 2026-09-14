@@ -23,15 +23,27 @@ if ($repo -like "*OneDrive*") {
 # virtualenv exists the task still registered fine and then failed silently at
 # every trigger, because Task Scheduler does not validate -Execute up front.
 # Resolve a real interpreter now and refuse to register without one.
-$python = Join-Path $repo ".venv\Scripts\python.exe"
-if (-not (Test-Path $python)) {
-    $fallback = Get-Command python.exe -ErrorAction SilentlyContinue
-    if (-not $fallback) {
-        Write-Error "No interpreter found: '$python' is missing and python.exe is not on PATH. Create the venv or install Python, then re-run."
-        exit 1
-    }
-    $python = $fallback.Source
-    Write-Warning "No .venv found; falling back to the interpreter on PATH: $python"
+#
+# BUGFIX: prefer pythonw.exe. python.exe allocates a console, and at logon that
+# console is torn down moments later, killing the scheduler with 0xC000013A
+# (STATUS_CONTROL_C_EXIT) before it writes a single log line. pythonw.exe has no
+# console, so nothing can close it. scheduler.py logs to scheduler.log either way.
+$candidates = @(
+    (Join-Path $repo ".venv\Scripts\pythonw.exe"),
+    (Join-Path $repo ".venv\Scripts\python.exe")
+)
+foreach ($exe in @('pythonw.exe', 'python.exe')) {
+    $found = Get-Command $exe -ErrorAction SilentlyContinue
+    if ($found) { $candidates += $found.Source }
+}
+
+$python = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $python) {
+    Write-Error "No interpreter found: no pythonw.exe/python.exe in '$repo\.venv\Scripts' or on PATH. Create the venv or install Python, then re-run."
+    exit 1
+}
+if ($python -notlike '*pythonw.exe') {
+    Write-Warning "Using $python, which allocates a console. pythonw.exe was not found, so the task may be killed at logon when that console closes."
 }
 Write-Host "Interpreter: $python"
 
