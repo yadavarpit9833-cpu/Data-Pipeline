@@ -232,6 +232,58 @@ For a point-in-time view of every source:
 python monitor_health.py
 ```
 
+## Historical backfill
+
+The live fetchers only reach near-real-time feeds. FIRMS NRT, for instance, spans
+roughly the last two months, so historical fire data needs the Standard Processing
+(SP) archives instead:
+
+```bash
+python backfill_firms.py                       # Jan/Oct/Nov/Dec of 2020-2025
+python backfill_firms.py --years 2023 2024     # specific years
+python backfill_firms.py --months 10 11        # specific months
+python backfill_firms.py --dry-run             # print the plan, fetch nothing
+```
+
+The default window is January, October, November and December of 2020-2025 — the
+months that matter for stubble burning and winter pollution. `--sources` selects
+the sensors; the default pair mirrors the live fetcher.
+
+| Source | Archive coverage | Resolution |
+|---|---|---|
+| `VIIRS_SNPP_SP` | 2012-01-20 onward | 375 m |
+| `MODIS_SP` | 2000-11-01 onward | 1 km |
+| `VIIRS_NOAA20_SP` | 2018-04-01 onward | 375 m |
+
+Availability is checked against the FIRMS `data_availability` endpoint before any
+month is requested, so a period the archive cannot serve is skipped up front rather
+than failing mid-run.
+
+Three things differ from the live fetcher, deliberately:
+
+- **The area API caps `day_range` at 5**, not 10. Each month is split into chunks
+  that cover the tail as well, so a 31-day month ends with a single-day chunk
+  rather than losing the 31st.
+- **Parquet partitions by observation date**, not fetch date, so historical rows
+  land in the partition they belong to.
+- **Rows are written with `executemany`.** One month of VIIRS runs to tens of
+  thousands of detections; the live fetcher's per-row loop does not keep up.
+
+Re-running is safe. Inserts are idempotent on the same keys the live fetcher uses
+and Parquet partitions are read-merge-written, so an interrupted run can simply be
+started again.
+
+Measured on January 2020: 42,502 rows in 50 seconds, zero contract failures, full
+month coverage. Burning-season months run several times larger — November 2020
+returned 113,659 rows against January's 42,502.
+
+Rate limits are worth a glance before a large run; the MAP_KEY status endpoint
+reports the current budget:
+
+```bash
+curl "https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=$FIRMS_MAP_KEY"
+```
+
 ## Data quality control
 
 - **Real pollution spikes are preserved.** Flagged readings are never deleted or set to
@@ -299,6 +351,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `query_db.py` | Row counts for every table |
 | `diagnose_gfs.py` | GFS coverage, cycles and valid times |
 | `inspect_firms.py` | FIRMS entries and duplicate check |
+| `backfill_firms.py` | Load historical FIRMS fires from the SP archives |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
 | `migrate_db.py` | Rebuild tables against the current schema |
 | `migrate_sqlite_to_parquet.py` | Export existing SQLite rows into the Parquet lake |
