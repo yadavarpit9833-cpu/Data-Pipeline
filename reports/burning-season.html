@@ -1,0 +1,695 @@
+<!--
+  India Burning Season - static report.
+
+  Figures are baked into this file, so it is a snapshot, not a live view.
+  Built from the pipeline database on 2026-09-15, covering January, October,
+  November and December of 2020-2025:
+
+      1,502,393 FIRMS detections   (backfill_firms.py)
+        194,832 weather hours      (backfill_weather.py, 13 stations)
+
+  To refresh the numbers after the database changes, re-run:
+
+      python analyze_fire_weather.py --station Delhi
+      python analyze_fire_weather.py --station Amritsar
+      python analyze_fire_weather.py --station Patiala
+
+  and update the DATA, DAILY, RAIN and RHO constants in the script block below.
+  Open the file directly in a browser - it needs no server and no build step.
+
+  Palette: dataviz categorical slots 1-4, validated for colour-vision deficiency
+  in both light and dark modes. The dumbbell deliberately uses two categorical
+  slots rather than two shades of one hue: the dark-mode lightness band
+  (L 0.48-0.67) is too narrow for two steps of a single hue to stay apart.
+-->
+<title>India Burning Season</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --surface:    #fcfcfb;
+  --panel:      #f4f3f0;
+  --rule:       #e2e0da;
+  --rule-soft:  #ecebe6;
+  --ink:        #14130f;
+  --ink-2:      #52514e;
+  --ink-3:      #84827a;
+  --s1: #2a78d6;   /* Jan */
+  --s2: #eb6834;   /* Oct */
+  --s3: #1baf7a;   /* Nov */
+  --s4: #eda100;   /* Dec */
+  --accent: #eb6834;
+  --grid: #e6e4de;
+  --tip-bg: #14130f;
+  --tip-ink: #fcfcfb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface:   #1a1a19;
+    --panel:     #232321;
+    --rule:      #38382f;
+    --rule-soft: #2b2b28;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --ink-3:     #8d8c82;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --accent: #d95926;
+    --grid: #333330;
+    --tip-bg: #f4f3f0;
+    --tip-ink: #14130f;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface:   #1a1a19;
+  --panel:     #232321;
+  --rule:      #38382f;
+  --rule-soft: #2b2b28;
+  --ink:       #ffffff;
+  --ink-2:     #c3c2b7;
+  --ink-3:     #8d8c82;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --accent: #d95926;
+  --grid: #333330;
+  --tip-bg: #f4f3f0;
+  --tip-ink: #14130f;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--surface);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-weight: 400;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-inline: 20px;
+  padding-block: 44px 72px;
+}
+.mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+/* ---- header ---- */
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; font-weight: 500; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3);
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline;
+}
+h1 {
+  font-size: clamp(30px, 6vw, 46px);
+  font-weight: 600; letter-spacing: -.026em; line-height: 1.05;
+  margin: 12px 0 0; text-wrap: balance;
+}
+.standfirst {
+  max-width: 62ch; color: var(--ink-2); font-size: 16.5px;
+  font-weight: 300; margin: 14px 0 0;
+}
+.standfirst strong { font-weight: 500; color: var(--ink); }
+
+/* ---- stat row ---- */
+.stats {
+  display: grid; gap: 1px; margin-top: 36px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  background: var(--rule); border: 1px solid var(--rule);
+}
+.stat { background: var(--surface); padding: 18px 20px 20px; }
+.stat .k {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500;
+}
+.stat .v {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 27px; font-weight: 500; letter-spacing: -.02em;
+  margin-top: 8px; line-height: 1.1;
+}
+.stat .n { font-size: 12.5px; color: var(--ink-2); margin-top: 5px; line-height: 1.4; }
+
+/* ---- sections ---- */
+section { margin-top: 56px; }
+h2 {
+  font-size: 19px; font-weight: 600; letter-spacing: -.012em; margin: 0;
+}
+.sub { color: var(--ink-2); font-size: 14px; margin: 6px 0 0; max-width: 66ch; font-weight: 300; }
+.figure {
+  margin-top: 20px; border: 1px solid var(--rule);
+  background: var(--surface); padding: 18px 16px 10px;
+}
+
+/* ---- legend ---- */
+.legend {
+  display: flex; flex-wrap: wrap; gap: 6px 20px;
+  padding: 0 4px 14px; align-items: center;
+}
+.lg { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.sw { width: 15px; height: 3px; border-radius: 2px; display: block; }
+
+svg { display: block; width: 100%; height: auto; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.axis-lbl {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; fill: var(--ink-3);
+}
+.dlabel {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11.5px; font-weight: 500;
+}
+.smtitle {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; font-weight: 500; fill: var(--ink);
+}
+.smnote {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10.5px; fill: var(--ink-3);
+}
+
+/* ---- tooltip ---- */
+.tipwrap { position: relative; }
+.tip {
+  position: absolute; pointer-events: none; opacity: 0;
+  transition: opacity .1s; background: var(--tip-bg); color: var(--tip-ink);
+  padding: 9px 11px; font-size: 12px; min-width: 132px;
+  border-radius: 3px; z-index: 5; line-height: 1.45;
+}
+.tip .th {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; letter-spacing: .07em; opacity: .62;
+  text-transform: uppercase; margin-bottom: 5px;
+}
+.tip .tr { display: flex; align-items: center; gap: 7px; justify-content: space-between; }
+.tip .tl { display: flex; align-items: center; gap: 7px; }
+.tip .tv { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+/* ---- table ---- */
+.tablewrap { overflow-x: auto; margin-top: 20px; border: 1px solid var(--rule); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+caption {
+  text-align: left; padding: 14px 16px 12px; color: var(--ink-2);
+  font-size: 13px; font-weight: 300; border-bottom: 1px solid var(--rule-soft);
+}
+th, td {
+  padding: 9px 16px; text-align: right; white-space: nowrap;
+  border-bottom: 1px solid var(--rule-soft);
+}
+th:first-child, td:first-child { text-align: left; }
+thead th {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500;
+}
+tbody td { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+tbody tr:last-child td { border-bottom: 0; }
+tfoot td {
+  font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums;
+  font-weight: 600; border-top: 1px solid var(--rule); border-bottom: 0;
+}
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+
+/* ---- notes ---- */
+.notes { margin-top: 52px; border-top: 1px solid var(--rule); padding-top: 22px; }
+.notes h3 {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500; margin: 0 0 12px;
+}
+.notes ul { margin: 0; padding-left: 18px; color: var(--ink-2); font-size: 13.5px; font-weight: 300; }
+.notes li { margin-bottom: 7px; max-width: 76ch; }
+.notes code {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px; background: var(--panel); padding: 1px 5px; border-radius: 2px; color: var(--ink);
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (max-width: 520px) {
+  .wrap { padding-block: 30px 48px; }
+  .figure { padding: 14px 8px 8px; }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">
+      <span>NASA FIRMS &middot; VIIRS SNPP + MODIS</span>
+      <span>6&deg;&ndash;37&deg;N, 68&deg;&ndash;97&deg;E</span>
+    </div>
+    <h1>India Burning Season</h1>
+    <p class="standfirst">
+      Every active-fire detection over India in January, October, November and December,
+      2020 through 2025 &mdash; <strong>1,502,393</strong> of them. November carries the season
+      every year, and the peak has been falling since 2021.
+    </p>
+  </header>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="k">Total detections</div>
+      <div class="v">1,502,393</div>
+      <div class="n">24 months, 738 days</div>
+    </div>
+    <div class="stat">
+      <div class="k">November share</div>
+      <div class="v">37.8<span style="font-size:17px">%</span></div>
+      <div class="v" style="display:none"></div>
+      <div class="n">568,399 in one month of four</div>
+    </div>
+    <div class="stat">
+      <div class="k">October, 2020 &rarr; 2025</div>
+      <div class="v" style="color:var(--s2)">&minus;60<span style="font-size:17px">%</span></div>
+      <div class="n">69,459 down to 27,602</div>
+    </div>
+    <div class="stat">
+      <div class="k">Busiest single day</div>
+      <div class="v">10,186</div>
+      <div class="n">5 Nov 2021 &mdash; 2025&rsquo;s peak was 4,944</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Detections by month, year over year</h2>
+    <p class="sub">
+      Each line follows one month across six years. November sits far above the rest and
+      falls after 2021; October declines in every single year of the series.
+    </p>
+    <div class="figure">
+      <div class="legend" id="legend"></div>
+      <div class="tipwrap">
+        <svg id="trend" viewBox="0 0 860 380" role="img"
+             aria-label="Line chart of FIRMS fire detections for January, October, November and December, 2020 to 2025."></svg>
+        <div class="tip" id="tip" aria-hidden="true"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Shape of the season, 1 October &ndash; 30 November</h2>
+    <p class="sub">
+      Daily detections through the stubble-burning window. The peak is both lower and later:
+      9,033 on 7 November 2020, against 4,944 on 16 November 2025. Every panel shares one
+      vertical scale, so heights compare directly.
+    </p>
+    <div class="figure">
+      <svg id="small" viewBox="0 0 860 366" role="img"
+           aria-label="Six small multiple charts, one per year, showing daily fire detections from 1 October to 30 November."></svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>Rain stops the burning</h2>
+    <p class="sub">
+      Detections in the belt on the day after rain, against the day after a dry day,
+      measured at three weather stations. Amritsar and Patiala sit inside the belt;
+      Delhi is 250&nbsp;km outside it and was the only option before those two were added.
+      All three agree, which is a stronger claim than any one of them makes alone.
+    </p>
+    <div class="figure">
+      <svg id="dumbbell" viewBox="0 0 860 220" role="img"
+           aria-label="Dumbbell chart comparing median fire detections after a dry day against after a wet day, at Delhi, Amritsar and Patiala."></svg>
+      <div class="legend" style="padding-top:12px">
+        <div class="lg"><span class="sw" style="background:var(--s2);height:11px;width:11px;border-radius:50%"></span>after a dry day</div>
+        <div class="lg"><span class="sw" style="background:var(--s1);height:11px;width:11px;border-radius:50%"></span>after rain &gt;1&nbsp;mm</div>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:14px">
+      The effect is weakest at Delhi&rsquo;s 0.14 ratio and strongest there only because Delhi
+      records the fewest wet days of the three. Amritsar, inside the belt and with the most
+      rain, gives 0.20 &mdash; so treat that as the honest figure.
+    </p>
+  </section>
+
+  <section>
+    <h2>Does it hold every year?</h2>
+    <p class="sub">
+      Rank correlation between daily rainfall and daily detections, per station per year.
+      A correlation is only worth trusting if its sign stays put; bars left of the line are
+      negative, meaning more rain went with fewer fires.
+    </p>
+    <div class="figure">
+      <svg id="rhogrid" viewBox="0 0 860 584" role="img"
+           aria-label="Small bar chart grid of rainfall-fire rank correlation per station per year."></svg>
+    </div>
+    <p class="sub" style="margin-top:14px">
+      Patiala is negative in all six years. Delhi has no bar for 2024 because no rain fell
+      there at all that October or November, so the correlation is undefined rather than
+      missing. Amritsar&rsquo;s 2022 and 2024 sit near zero &mdash; the signal is directionally
+      consistent but not uniformly strong.
+    </p>
+  </section>
+
+  <section>
+    <h2>The numbers</h2>
+    <div class="tablewrap">
+      <table>
+        <caption>Fire detections by year and month. Source: NASA FIRMS VIIRS_SNPP_SP and MODIS_SP archives.</caption>
+        <thead>
+          <tr><th scope="col">Year</th><th scope="col">Jan</th><th scope="col">Oct</th><th scope="col">Nov</th><th scope="col">Dec</th><th scope="col">Total</th></tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+        <tfoot id="tfoot"></tfoot>
+      </table>
+    </div>
+  </section>
+
+  <div class="notes">
+    <h3>Method &amp; caveats</h3>
+    <ul>
+      <li><strong>A detection is not a fire.</strong> Each row is one satellite pixel flagged as
+        actively burning at overpass. One fire spanning several pixels counts several times, and a
+        fire between overpasses is missed entirely.</li>
+      <li><strong>Two sensors, different footprints.</strong> VIIRS SNPP resolves 375&nbsp;m and
+        supplies 1,280,086 of the rows; MODIS resolves 1&nbsp;km and supplies 222,640. Counts are
+        not directly comparable between them.</li>
+      <li><strong>Cloud cover suppresses counts.</strong> A lower number can mean less burning or
+        more cloud. The decline shown here is real in the data, but attributing it to enforcement,
+        weather or crop timing needs work this chart does not do.</li>
+      <li><strong>Archive, not near-real-time.</strong> Pulled from the Standard Processing
+        archives via <code>backfill_firms.py</code>, which reprocess and slightly revise the
+        NRT feed.</li>
+      <li>738 distinct days appear where 731 were expected: timestamps are UTC, so late-evening
+        overpasses spill into the next calendar day.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const MONTHS = [
+  { key: "01", name: "Jan", color: "var(--s1)" },
+  { key: "10", name: "Oct", color: "var(--s2)" },
+  { key: "11", name: "Nov", color: "var(--s3)" },
+  { key: "12", name: "Dec", color: "var(--s4)" }
+];
+const YEARS = ["2020", "2021", "2022", "2023", "2024", "2025"];
+const DATA = {
+  "2020": { "01": 42502, "10": 69459, "11": 113659, "12": 59841 },
+  "2021": { "01": 63419, "10": 48942, "11": 133608, "12": 41470 },
+  "2022": { "01": 36500, "10": 43303, "11": 96667,  "12": 57601 },
+  "2023": { "01": 68541, "10": 39770, "11": 80548,  "12": 52419 },
+  "2024": { "01": 51448, "10": 29288, "11": 70132,  "12": 60807 },
+  "2025": { "01": 64477, "10": 27602, "11": 73785,  "12": 76605 }
+};
+const DAILY = {
+  "2020": [600,636,611,713,1025,1231,900,825,699,1013,1527,1555,981,1457,1428,2034,2626,2479,2019,1931,2730,2948,2876,2109,2796,3807,4412,5871,3251,6483,5886,6774,7034,5190,7827,7115,8624,9033,7391,4012,5547,5641,4013,5288,1931,1541,1083,1992,2622,1849,2675,2377,1596,1573,1490,1095,722,1502,1974,2125,2023],
+  "2021": [286,272,385,376,305,508,573,812,1022,1288,899,778,1303,1771,3026,1761,399,399,1528,2661,2075,2762,1568,702,1175,1627,1516,2417,3442,4130,7176,4102,5611,4771,6461,10186,6975,9272,7493,9411,8740,7812,5946,6619,5716,4346,5425,2239,2282,1840,1580,2160,1685,1734,1309,1654,1982,2047,1789,1378,1043],
+  "2022": [424,453,380,274,506,531,513,495,308,229,268,503,545,521,702,850,1333,1100,1365,747,1254,1765,2639,2858,1865,2587,2334,4597,3915,3538,3904,3250,6239,4806,4472,4689,1931,4828,3217,3963,3518,6525,4959,5670,2129,2032,3082,2942,3139,2921,2773,1792,1880,1984,2211,2343,1793,1673,1512,2234,2160],
+  "2023": [412,400,489,678,805,825,508,899,860,966,1004,823,1016,961,1280,673,652,608,901,2025,1489,1248,859,1417,2177,2895,2781,1170,2666,2643,3640,3942,516,3352,2894,6435,4456,3356,3904,2085,1769,2442,3072,3559,3374,5218,3839,3538,2483,2416,2568,2707,3033,2005,1736,1345,954,649,1057,1082,762],
+  "2024": [629,480,411,367,461,754,560,590,552,662,830,1175,899,662,742,839,1204,1008,789,499,882,1905,1433,1051,820,944,1461,1927,1637,1136,1979,2663,3232,846,128,610,779,2803,3744,2164,2327,1973,2301,4060,2176,2290,1608,3808,4899,3233,2794,1874,2093,2894,3275,2675,1608,1629,2053,2005,1588],
+  "2025": [244,171,445,528,238,168,184,273,712,563,772,711,714,1122,1274,1171,1062,914,1442,1693,1168,1376,925,1359,1598,1457,850,381,1067,1246,1774,1827,1355,1426,1834,2516,2614,1886,2317,3110,2758,3726,820,2580,2562,2872,4944,2891,2528,2065,2146,3322,2918,2509,2140,2222,2843,2795,2681,2190,1388]
+};
+const NS = "http://www.w3.org/2000/svg";
+const fmt = n => n.toLocaleString("en-US");
+const el = (t, a = {}) => { const e = document.createElementNS(NS, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+
+/* ---------- legend ---------- */
+const legend = document.getElementById("legend");
+MONTHS.forEach(m => {
+  const d = document.createElement("div");
+  d.className = "lg";
+  d.innerHTML = `<span class="sw" style="background:${m.color}"></span>${m.name}`;
+  legend.appendChild(d);
+});
+
+/* ---------- chart 1: year-over-year lines ---------- */
+(function trend() {
+  const svg = document.getElementById("trend");
+  const W = 860, H = 380, L = 56, R = 58, T = 18, B = 40;
+  const iw = W - L - R, ih = H - T - B;
+  const max = 140000;
+  const x = i => L + (iw * i) / (YEARS.length - 1);
+  const y = v => T + ih - (v / max) * ih;
+
+  for (let v = 0; v <= max; v += 20000) {
+    svg.appendChild(el("line", { x1: L, x2: L + iw, y1: y(v), y2: y(v), class: "gridline" }));
+    const t = el("text", { x: L - 10, y: y(v) + 4, class: "axis-lbl", "text-anchor": "end" });
+    t.textContent = v === 0 ? "0" : (v / 1000) + "k";
+    svg.appendChild(t);
+  }
+  YEARS.forEach((yr, i) => {
+    const t = el("text", { x: x(i), y: T + ih + 25, class: "axis-lbl", "text-anchor": "middle" });
+    t.textContent = yr;
+    svg.appendChild(t);
+  });
+
+  const ends = [];
+  MONTHS.forEach(m => {
+    const pts = YEARS.map((yr, i) => [x(i), y(DATA[yr][m.key])]);
+    svg.appendChild(el("path", {
+      d: pts.map((p, i) => (i ? "L" : "M") + p[0] + " " + p[1]).join(" "),
+      fill: "none", stroke: m.color, "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-linejoin": "round"
+    }));
+    pts.forEach(p => {
+      svg.appendChild(el("circle", { cx: p[0], cy: p[1], r: 4.5, fill: "var(--surface)", stroke: m.color, "stroke-width": 2 }));
+    });
+    const last = pts[pts.length - 1];
+    ends.push({ m: m, px: last[0], py: last[1], py0: last[1] });
+  });
+
+  // Direct labels are mandatory at four series, but two of the 2025 values sit
+  // 6.5px apart at an 11.5px type size. Push the labels apart to a legible
+  // minimum and hairline-connect each back to the point it names.
+  const MIN = 13;
+  ends.sort((a, b) => a.py - b.py);
+  for (let i = 1; i < ends.length; i++) {
+    if (ends[i].py - ends[i - 1].py < MIN) ends[i].py = ends[i - 1].py + MIN;
+  }
+  const overflow = ends[ends.length - 1].py - (T + ih);
+  if (overflow > 0) ends.forEach(e => e.py -= overflow);
+  ends.forEach(e => {
+    svg.appendChild(el("line", {
+      x1: e.px + 5, y1: e.py0 !== undefined ? e.py0 : e.py, x2: e.px + 9, y2: e.py,
+      stroke: e.m.color, "stroke-width": 1, opacity: .55
+    }));
+    const lab = el("text", { x: e.px + 12, y: e.py + 4, class: "dlabel", fill: e.m.color });
+    lab.textContent = e.m.name;
+    svg.appendChild(lab);
+  });
+
+  // hover crosshair + tooltip
+  const rule = el("line", { y1: T, y2: T + ih, class: "gridline", stroke: "var(--ink-3)", "stroke-width": 1, opacity: 0 });
+  svg.appendChild(rule);
+  const tip = document.getElementById("tip");
+  const hit = el("rect", { x: L, y: T, width: iw, height: ih, fill: "transparent", style: "cursor:crosshair" });
+  svg.appendChild(hit);
+
+  function show(ev) {
+    const r = svg.getBoundingClientRect();
+    const px = ((ev.clientX - r.left) / r.width) * W;
+    let i = Math.round(((px - L) / iw) * (YEARS.length - 1));
+    i = Math.max(0, Math.min(YEARS.length - 1, i));
+    const yr = YEARS[i];
+    rule.setAttribute("x1", x(i)); rule.setAttribute("x2", x(i)); rule.setAttribute("opacity", .5);
+    tip.innerHTML = `<div class="th">${yr}</div>` + MONTHS.map(m =>
+      `<div class="tr"><span class="tl"><span class="sw" style="background:${m.color}"></span>${m.name}</span><span class="tv">${fmt(DATA[yr][m.key])}</span></div>`).join("");
+    tip.style.opacity = 1;
+    const left = (x(i) / W) * r.width;
+    tip.style.left = Math.min(Math.max(left - 70, 0), r.width - 150) + "px";
+    tip.style.top = "8px";
+  }
+  hit.addEventListener("mousemove", show);
+  hit.addEventListener("mouseleave", () => { tip.style.opacity = 0; rule.setAttribute("opacity", 0); });
+})();
+
+/* ---------- chart 2: small multiples, daily Oct 1 - Nov 30 ---------- */
+(function small() {
+  const svg = document.getElementById("small");
+  const W = 860, H = 366;
+  // gapY has to clear row one's "1 Oct / 30 Nov" labels AND row two's title
+  const cols = 3, rows = 2, gapX = 26, gapY = 56;
+  const padL = 8, padT = 26, padB = 26, padR = 8;
+  const pw = (W - padL - padR - gapX * (cols - 1)) / cols;
+  const ph = (H - padT - padB - gapY * (rows - 1)) / rows;
+  const max = 10186;
+
+  YEARS.forEach((yr, idx) => {
+    const c = idx % cols, r = Math.floor(idx / cols);
+    const ox = padL + c * (pw + gapX);
+    const oy = padT + r * (ph + gapY);
+    const vals = DAILY[yr];
+    const x = i => ox + (pw * i) / (vals.length - 1);
+    const y = v => oy + ph - (v / max) * ph;
+
+    svg.appendChild(el("line", { x1: ox, x2: ox + pw, y1: oy + ph, y2: oy + ph, class: "gridline" }));
+
+    // area under the curve, then the line on top
+    const line = vals.map((v, i) => (i ? "L" : "M") + x(i) + " " + y(v)).join(" ");
+    svg.appendChild(el("path", {
+      d: `${line} L ${x(vals.length - 1)} ${oy + ph} L ${ox} ${oy + ph} Z`,
+      fill: "var(--s2)", opacity: .13, stroke: "none"
+    }));
+    svg.appendChild(el("path", { d: line, fill: "none", stroke: "var(--s2)", "stroke-width": 1.4, "stroke-linejoin": "round" }));
+
+    // emphasised peak
+    const mx = Math.max(...vals), mi = vals.indexOf(mx);
+    svg.appendChild(el("circle", { cx: x(mi), cy: y(mx), r: 3.6, fill: "var(--s2)", stroke: "var(--surface)", "stroke-width": 2 }));
+
+    const ttl = el("text", { x: ox, y: oy - 11, class: "smtitle" });
+    ttl.textContent = yr;
+    svg.appendChild(ttl);
+
+    const pk = el("text", { x: ox + pw, y: oy - 11, class: "smnote", "text-anchor": "end" });
+    pk.textContent = "peak " + fmt(mx);
+    svg.appendChild(pk);
+
+    ["1 Oct", "30 Nov"].forEach((lbl, k) => {
+      const t = el("text", {
+        x: k ? ox + pw : ox, y: oy + ph + 15,
+        class: "smnote", "text-anchor": k ? "end" : "start"
+      });
+      t.textContent = lbl;
+      svg.appendChild(t);
+    });
+  });
+})();
+
+/* ---------- table ---------- */
+(function table() {
+  const tb = document.getElementById("tbody");
+  const tf = document.getElementById("tfoot");
+  const totals = { "01": 0, "10": 0, "11": 0, "12": 0 };
+  YEARS.forEach(yr => {
+    const tr = document.createElement("tr");
+    let sum = 0;
+    let cells = `<td>${yr}</td>`;
+    MONTHS.forEach(m => {
+      const v = DATA[yr][m.key];
+      sum += v; totals[m.key] += v;
+      cells += `<td>${fmt(v)}</td>`;
+    });
+    tr.innerHTML = cells + `<td>${fmt(sum)}</td>`;
+    tb.appendChild(tr);
+  });
+  const grand = Object.values(totals).reduce((a, b) => a + b, 0);
+  tf.innerHTML = `<tr><td>Total</td>` +
+    MONTHS.map(m => `<td>${fmt(totals[m.key])}</td>`).join("") +
+    `<td>${fmt(grand)}</td></tr>`;
+  // colour key on the header, so identity is never colour-alone in the table either
+  document.querySelectorAll("thead th").forEach((th, i) => {
+    if (i > 0 && i <= MONTHS.length) {
+      th.innerHTML = `<span class="dot" style="background:${MONTHS[i - 1].color}"></span>${th.textContent}`;
+    }
+  });
+})();
+
+/* ---------- rain: dumbbell, dry vs wet ---------- */
+const RAIN = [
+  { st: "Delhi",    dry: 318, wet: 45, dryN: 318, wetN: 23, ratio: 0.14, inBelt: false },
+  { st: "Amritsar", dry: 320, wet: 63, dryN: 311, wetN: 33, ratio: 0.20, inBelt: true },
+  { st: "Patiala",  dry: 328, wet: 58, dryN: 322, wetN: 19, ratio: 0.18, inBelt: true }
+];
+(function dumbbell() {
+  const svg = document.getElementById("dumbbell");
+  const W = 860, L = 108, R = 150, T = 30, rowH = 52;
+  const iw = W - L - R, max = 380;
+  const x = v => L + (iw * v) / max;
+
+  [0, 100, 200, 300].forEach(v => {
+    svg.appendChild(el("line", { x1: x(v), x2: x(v), y1: T - 10, y2: T + rowH * RAIN.length - 18, class: "gridline" }));
+    const t = el("text", { x: x(v), y: T + rowH * RAIN.length - 2, class: "axis-lbl", "text-anchor": "middle" });
+    t.textContent = v;
+    svg.appendChild(t);
+  });
+  const cap = el("text", { x: L, y: T - 18, class: "smnote" });
+  cap.textContent = "median detections in the belt";
+  svg.appendChild(cap);
+
+  RAIN.forEach((r, i) => {
+    const y = T + i * rowH + 8;
+    const nm = el("text", { x: L - 14, y: y + 4, class: "dlabel", fill: "var(--ink)", "text-anchor": "end" });
+    nm.textContent = r.st;
+    svg.appendChild(nm);
+    if (r.inBelt) {
+      const b = el("text", { x: L - 14, y: y + 18, class: "smnote", "text-anchor": "end" });
+      b.textContent = "in belt";
+      svg.appendChild(b);
+    }
+
+    svg.appendChild(el("line", { x1: x(r.wet), x2: x(r.dry), y1: y, y2: y,
+                                 stroke: "var(--ink-3)", "stroke-width": 2, opacity: .38 }));
+    svg.appendChild(el("circle", { cx: x(r.wet), cy: y, r: 6.5, fill: "var(--s1)",
+                                   stroke: "var(--surface)", "stroke-width": 2 }));
+    svg.appendChild(el("circle", { cx: x(r.dry), cy: y, r: 6.5, fill: "var(--s2)",
+                                   stroke: "var(--surface)", "stroke-width": 2 }));
+
+    // direct labels on both ends - identity never rests on colour alone
+    const lw = el("text", { x: x(r.wet), y: y - 13, class: "smnote", "text-anchor": "middle", fill: "var(--ink-2)" });
+    lw.textContent = r.wet;
+    svg.appendChild(lw);
+    const ld = el("text", { x: x(r.dry), y: y - 13, class: "smnote", "text-anchor": "middle", fill: "var(--ink-2)" });
+    ld.textContent = r.dry;
+    svg.appendChild(ld);
+
+    const rt = el("text", { x: L + iw + 22, y: y + 4, class: "dlabel", fill: "var(--s2)" });
+    rt.textContent = "ratio " + r.ratio.toFixed(2);
+    svg.appendChild(rt);
+    const n = el("text", { x: L + iw + 22, y: y + 18, class: "smnote" });
+    n.textContent = "n=" + r.wetN + " wet / " + r.dryN + " dry";
+    svg.appendChild(n);
+  });
+})();
+
+/* ---------- rainfall rho per station per year ---------- */
+const RHO = {
+  Delhi:    { 2020: -0.389, 2021: -0.552, 2022: -0.280, 2023: -0.463, 2024: null,  2025: -0.382 },
+  Amritsar: { 2020: -0.384, 2021: -0.405, 2022: -0.044, 2023: -0.398, 2024: 0.012, 2025: -0.246 },
+  Patiala:  { 2020: -0.389, 2021: -0.320, 2022: -0.496, 2023: -0.293, 2024: -0.198, 2025: -0.354 }
+};
+(function rhogrid() {
+  // Layout note: an earlier version anchored each value label to the end of its
+  // own bar. At rho -0.55 the bar nearly fills the track, so the label collided
+  // with the year label beside it. Values now live in their own right-hand
+  // column, which cannot collide however long a bar gets.
+  const svg = document.getElementById("rhogrid");
+  const W = 860, YEARLBL = 96, VALCOL = 84;
+  const zero = W - VALCOL - 26;            // bars grow leftwards from here
+  const track = zero - YEARLBL - 14;
+  const T = 40, rowH = 26, gapS = 26;
+  const SCALE = 0.6;                       // |rho| 0.6 fills the track
+  const x = v => zero + (track * v) / SCALE;
+  const names = Object.keys(RHO);
+
+  const lbl = el("text", { x: YEARLBL, y: 18, class: "smnote" });
+  lbl.textContent = "Spearman rho, rainfall vs detections \u2014 0 at the line, negative to the left";
+  svg.appendChild(lbl);
+
+  let y = T;
+  names.forEach((st, si) => {
+    const blockTop = y;
+    const h = el("text", { x: 0, y: y - 9, class: "smtitle" });
+    h.textContent = st;
+    svg.appendChild(h);
+
+    YEARS.forEach(yr => {
+      const v = RHO[st][yr];
+      const yl = el("text", { x: YEARLBL, y: y + 11, class: "axis-lbl", "text-anchor": "end" });
+      yl.textContent = yr;
+      svg.appendChild(yl);
+
+      if (v === null || v === undefined) {
+        const t = el("text", { x: zero - track, y: y + 11, class: "smnote" });
+        t.textContent = "no rain fell \u2014 undefined";
+        svg.appendChild(t);
+        const d = el("text", { x: W, y: y + 11, class: "smnote", "text-anchor": "end" });
+        d.textContent = "\u2014";
+        svg.appendChild(d);
+      } else {
+        const x0 = Math.min(zero, x(v)), w = Math.abs(x(v) - zero);
+        svg.appendChild(el("rect", { x: x0, y: y + 3, width: Math.max(w, 1.5), height: 11,
+                                     rx: 2, fill: "var(--s1)" }));
+        const t = el("text", { x: W, y: y + 12, class: "smnote", "text-anchor": "end",
+                               fill: "var(--ink-2)" });
+        t.textContent = v.toFixed(3);
+        svg.appendChild(t);
+      }
+      y += rowH;
+    });
+
+    svg.appendChild(el("line", { x1: zero, x2: zero, y1: blockTop, y2: y - 3,
+                                 stroke: "var(--ink-3)", "stroke-width": 1 }));
+    if (si < names.length - 1) y += gapS;
+  });
+})();
+</script>

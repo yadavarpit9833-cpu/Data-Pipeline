@@ -344,7 +344,16 @@ whether any number it prints means anything:
   pipeline does not carry.
 
 The strongest signal in the default window is rain: median 45 detections the day
-after rain against 318 after a dry day, a ratio of 0.14.
+after rain against 318 after a dry day, a ratio of 0.14 at Delhi — 0.20 at Amritsar,
+which sits inside the belt and records more wet days, so treat that as the honest
+figure.
+
+`reports/burning-season.html` presents all of this as a standalone page: detections
+by month year over year, the daily shape of each season, the rain dumbbell across the
+three stations, and the per-year rank correlations. It opens straight in a browser
+with no server or build step. The figures are baked in, so it is a snapshot rather
+than a live view — the file header records the data state it was built from and which
+commands regenerate the numbers.
 
 Amritsar and Patiala sit inside the belt, so the analysis no longer has to lean on
 Delhi from 250 km away. Running all three is a useful robustness check rather than a
@@ -421,6 +430,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `backfill_firms.py` | Load historical FIRMS fires from the SP archives |
 | `backfill_weather.py` | Load historical weather from the Open-Meteo archive |
 | `analyze_fire_weather.py` | Correlate belt fire counts against station weather |
+| `reports/burning-season.html` | Standalone report page built from the two backfills |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
 | `migrate_db.py` | Rebuild tables against the current schema |
 | `migrate_sqlite_to_parquet.py` | Export existing SQLite rows into the Parquet lake |
