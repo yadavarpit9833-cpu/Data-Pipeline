@@ -135,6 +135,13 @@ python fetch_waqi.py
 python fetch_gfs.py
 ```
 
+See everything at once — row counts, date coverage, fire seasonality, gold
+tables — in a single output you can save or share:
+
+```bash
+python scripts/report.py
+```
+
 Check pipeline health (exits non-zero when anything is stale):
 
 ```bash
