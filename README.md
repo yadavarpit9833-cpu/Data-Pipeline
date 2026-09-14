@@ -44,12 +44,12 @@ flowchart LR
 
     QC -.->|failed rows| CSV["contract_failures_*.csv"]:::fail
 
-    classDef src fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b45
-    classDef bronze fill:#f4e4d4,stroke:#a97142,color:#3d2a17
-    classDef silver fill:#e9ecef,stroke:#868e96,color:#212529
-    classDef gold fill:#fff3bf,stroke:#c99a06,color:#3d3000
-    classDef qc fill:#f3e8fd,stroke:#8d5bc4,color:#2e1a45
-    classDef fail fill:#ffe3e3,stroke:#c92a2a,color:#4a1010
+    classDef src fill:#c3d0e4,stroke:#5b7ba8,color:#1a2b45
+    classDef bronze fill:#dcc5ac,stroke:#9c6a3d,color:#3d2a17
+    classDef silver fill:#ccd1d7,stroke:#7c858e,color:#212529
+    classDef gold fill:#e2cf95,stroke:#b58d12,color:#3d3000
+    classDef qc fill:#d4c3e6,stroke:#8265ad,color:#2e1a45
+    classDef fail fill:#e5bdbd,stroke:#b34a4a,color:#4a1010
 ```
 
 Nothing is discarded along the way: raw payloads stay verbatim, QC failures are
@@ -87,24 +87,35 @@ the CAMS/Open-Meteo composite rather than direct TROPOMI L2 granules.
 
 #### Sample gold output
 
-`city_aqi_hourly` — hourly AQI per city, category derived from the aggregated `aqi_max`:
+Real rows the pipeline produced, abridged to the columns that matter most.
 
-| city | hour_bucket | pm25_mean | pm10_mean | aqi_max | aqi_category | n_stations |
-|---|---|---|---|---|---|---|
-| delhi | 2026-09-14T21:00:00+00:00 | 112.0 | 60.0 | 273.6 | Poor | 1 |
+**`city_aqi_hourly`** — `aqi_category` is derived from the aggregated `aqi_max`,
+so the two can never disagree:
 
-`city_daily_summary` — pollutants joined with weather; `wind_dir_daily_mean` is a
-circular mean, and a city with no matching weather station keeps its row with nulls:
+| city | pm25_mean | aqi_max | aqi_category | n_stations |
+|---|---|---|---|---|
+| delhi | 112.0 | 273.6 | Poor | 1 |
 
-| city | pm25_daily_mean | daily_aqi | daily_aqi_category | temp_daily_mean | humidity_daily_mean | rainfall_daily_total | wind_dir_daily_mean | n_weather_obs |
-|---|---|---|---|---|---|---|---|---|
-| delhi | 112.0 | 273.6 | Poor | 28.32 | 80.8 | 0.0 | 106.4 | 5 |
+Also carries `hour_bucket`, `pm10_mean`, `no2_mean` and `computed_at`.
 
-`gfs_grid_hourly` — one row per cycle and valid time over the India bounding box:
+**`city_daily_summary`** — pollutants left-joined with weather. `wind_dir_daily_mean`
+is a circular mean, and `n_weather_obs` shows how many weather rows backed the join
+(null for a city with no matching station):
 
-| cycle | valid_time | temp_mean | temp_max | precip_total | wind_speed_mean | n_grid_points |
-|---|---|---|---|---|---|---|
-| 20260914_00z | 2026-09-14T00:00:00+00:00 | 20.74 | 33.23 | 0.0 | 2.63 | 14625 |
+| city | daily_aqi | daily_aqi_category | temp_daily_mean | wind_dir_daily_mean | n_weather_obs |
+|---|---|---|---|---|---|
+| delhi | 273.6 | Poor | 28.32 | 106.4 | 5 |
+
+Also carries the six `*_daily_mean` pollutant columns, `humidity_daily_mean`,
+`rainfall_daily_total`, `temp_daily_max/min`, `wind_speed_daily_mean` and `n_obs`.
+
+**`gfs_grid_hourly`** — one row per cycle and valid time over the India bounding box:
+
+| cycle | temp_mean | temp_max | precip_total | n_grid_points |
+|---|---|---|---|---|
+| 20260914_00z | 20.74 | 33.23 | 0.0 | 14625 |
+
+Also carries `valid_time`, `temp_min` and `wind_speed_mean`.
 
 ### Supporting modules
 
