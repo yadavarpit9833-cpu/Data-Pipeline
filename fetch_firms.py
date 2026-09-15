@@ -65,7 +65,14 @@ def main():
 
     sensors = ['VIIRS_SNPP_NRT', 'MODIS_NRT']
     area = '68,6,97,37' # India bounding box
-    day_range = '1'
+    # BUGFIX: day_range '1' means "the current UTC day", which is empty for the
+    # first several hours of every day - India's VIIRS overpass lands around
+    # 08:00 UTC, so from midnight until then the API returns zero rows and the
+    # job logged a failure. Probed at 01:07 UTC: day_range 1 gave 0 rows,
+    # day_range 2 gave 368. Two days always spans at least one overpass, and the
+    # overlap costs nothing because inserts are idempotent on
+    # (lat, lon, timestamp, satellite).
+    day_range = '2'
     
     timestamp = datetime.now(timezone.utc).isoformat()
     all_dfs = []

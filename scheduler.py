@@ -150,10 +150,15 @@ if __name__ == '__main__':
         next_run_time=now_utc
     )
 
-    # GFS: every 6 hours (00, 06, 12, 18Z cycles, triggers immediately on startup, then on schedule)
+    # GFS: one run per 00/06/12/18Z cycle, but five and a half hours AFTER it.
+    # BUGFIX: this fired at cycle+30min, and NOAA has not published a cycle that
+    # early - probed directly, a 1.1h-old cycle 404s while a 7.1h-old one serves
+    # GRIB. Every scheduled run was therefore failing over to the hardcoded
+    # constant fallback and writing 14,625 synthetic rows. NOAA's own guidance
+    # puts availability at roughly cycle+3:30 to +5:00, so +5:30 leaves margin.
     scheduler.add_job(
         run_job,
-        CronTrigger(hour='0,6,12,18', minute=30, timezone='UTC'),
+        CronTrigger(hour='5,11,17,23', minute=30, timezone='UTC'),
         args=['gfs', 'GFS Grid Weather', fetch_gfs],
         id='gfs_job',
         next_run_time=now_utc
