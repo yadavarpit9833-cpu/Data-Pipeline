@@ -250,7 +250,8 @@ FIRMS NRT spans roughly the last two months, so historical fire data needs the
 Standard Processing (SP) archives:
 
 ```bash
-python backfill_firms.py                       # Jan/Oct/Nov/Dec of 2020-2025
+python backfill_firms.py --months 1 2 3 4 5 6 7 8 9 10 11 12   # what is loaded
+python backfill_firms.py                       # default: Jan/Oct/Nov/Dec only
 python backfill_firms.py --years 2023 2024     # specific years
 python backfill_firms.py --months 10 11        # specific months
 python backfill_firms.py --dry-run             # print the plan, fetch nothing
@@ -300,7 +301,8 @@ curl "https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=$FIR
 Open-Meteo's reanalysis archive reaches back to 1940 and needs no API key:
 
 ```bash
-python backfill_weather.py                     # Jan/Oct/Nov/Dec of 2020-2025
+python backfill_weather.py --months 1 2 3 4 5 6 7 8 9 10 11 12  # what is loaded
+python backfill_weather.py                     # default: Jan/Oct/Nov/Dec only
 python backfill_weather.py --years 2023 2024
 python backfill_weather.py --dry-run
 ```
@@ -316,10 +318,10 @@ Contiguous months collapse into a single request, so October–December is one s
 rather than three: 132 requests against the 324 the FIRMS backfill needs, because
 the archive endpoint takes a date range where the FIRMS area API caps at five days.
 
-Measured: 194,832 rows for the default window in about five minutes, zero contract
-failures for the original 11 stations — 11 × 123 days × 24 hours × 6 years.
-Amritsar and Patiala were added afterwards and loaded with `--stations`, another
-35,424 rows.
+Measured on the full twelve-month window: 683,904 rows in about seven minutes,
+zero contract failures — 13 stations × 2,192 days × 24 hours. Requests stay cheap
+because contiguous months collapse: twelve months is one span per year, 78 requests
+where the FIRMS backfill needs 948.
 
 ### Air quality — `backfill_airquality.py`
 
@@ -338,9 +340,10 @@ published. This loads the CAMS atmospheric composition reanalysis via Open-Meteo
 instead: a model product, not a measurement.
 
 **Coverage starts 2022-08-03.** Earlier dates return rows of nulls rather than an
-error, so the floor is enforced in the script. Of the 24-month window the fire and
-weather backfills cover, this fills 15 — October 2022 onward. 2020, 2021 and
-January 2022 cannot be filled from here.
+error, so the floor is enforced in the script. The fire and weather backfills cover
+2020 onward; this can only reach August 2022, so roughly the last three and a half
+years of that span. 239,192 rows across 8 cities, zero contract failures beyond 40
+negative concentrations the contract correctly rejected.
 
 Rows go to `cleaned_cams_aq`, deliberately not to `cleaned_cpcb`, because the two
 hold different quantities: WAQI gives AQI sub-indices, CAMS gives concentrations.
@@ -374,10 +377,10 @@ whether any number it prints means anything:
   effect with an observational artefact. Separating them needs cloud-mask data this
   pipeline does not carry.
 
-The strongest signal in the default window is rain: median 45 detections the day
-after rain against 318 after a dry day, a ratio of 0.14 at Delhi — 0.20 at Amritsar,
-which sits inside the belt and records more wet days, so treat that as the honest
-figure.
+Measured inside October and November only, rain looked like the strongest signal in
+the data: median 45 detections the day after rain against 318 after a dry day, a
+ratio of 0.14 at Delhi and 0.20 at Amritsar. With all twelve months loaded, most of
+that turns out to be the calendar. See the deseasonalised figures below.
 
 `reports/burning-season.html` presents all of this as a standalone page: detections
 by month year over year, the daily shape of each season, the rain dumbbell across the
@@ -392,28 +395,66 @@ Delhi from 250 km away. Running all three is a useful robustness check rather t
 choice between them: the rain result holds at every station (ratio 0.14 Delhi, 0.20
 Amritsar, 0.18 Patiala), which is a stronger claim than any single station makes.
 
+### What survives once the season is subtracted
+
+Everything above is measured inside a four-month window, where the seasonality
+caveat can only be flagged. With all twelve months loaded it can be removed: build a
+day-of-year climatology, take each day's anomaly from its own normal, and correlate
+those. Belt detections against Delhi, 2020–2025, 2,192 days:
+
+| Variable | Raw ρ | Deseasonalised ρ | Retained |
+|---|---|---|---|
+| humidity | −0.554 | **−0.320** | 58% |
+| rainfall | −0.553 | −0.179 | 32% |
+| temperature | +0.001 | **+0.157** | — |
+| wind speed | +0.040 | +0.107 | — |
+
+Three things change from the four-month reading:
+
+- **Humidity is the real driver, not rainfall.** It keeps 58% of its strength and is
+  the most consistent within-month signal, median ρ −0.408 across the twelve months.
+- **Rain suppression was mostly seasonal.** A third survives — real, but far less than
+  the 0.14/0.20 ratio suggested.
+- **Temperature reads +0.001 raw, which looks like nothing.** Two opposing seasonal
+  effects cancel. Deseasonalised it is +0.157. A four-month window could not have
+  found it, and this repo reported temperature as noise until the full year was loaded.
+
+### Two burning seasons, not one
+
+The four-month window also hid the larger fire season outright. Detections by
+calendar month, summed over 2020–2025:
+
+| | Jan | Feb | Mar | Apr | May | Jun | Jul | Aug | Sep | Oct | Nov | Dec |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| thousands | 327 | 667 | **1,814** | **1,546** | 553 | 115 | 31 | 32 | 46 | 258 | 568 | 349 |
+
+March and April carry 3,359,545 detections, 53% of the total, against October and
+November's 826,763 at 13%. Every one of the six years peaks in March or April; none
+peaks in November. The stubble season is the one with a name, not the one with the
+fire.
+
 ### The smoke-transport question, and why the data cannot answer it
 
 With CAMS air quality loaded, the obvious chart is belt fire detections against city
 PM2.5. It is in the report, as a negative result. Correlation of daily PM2.5 with
 daily belt detections, October and November 2022–2025:
 
-| City | km from belt | Spearman ρ |
-|---|---|---|
-| **mumbai** | **1,302** | **+0.350** |
-| delhi | 253 | +0.318 |
-| lucknow | 650 | +0.305 |
-| amritsar | 151 *(in belt)* | +0.209 |
-| kolkata | 1,532 | +0.187 |
-| patiala | 63 *(in belt)* | +0.168 |
-| bengaluru | 1,958 | +0.087 |
-| chennai | 1,992 | +0.074 |
+| City | km from belt | Raw ρ | Deseasonalised ρ |
+|---|---|---|---|
+| lucknow | 650 | +0.384 | +0.065 |
+| **mumbai** | **1,302** | **+0.342** | **+0.124** |
+| bengaluru | 1,958 | +0.340 | −0.016 |
+| delhi | 253 | +0.320 | +0.064 |
+| kolkata | 1,532 | +0.301 | −0.040 |
+| patiala | 63 *(in belt)* | +0.287 | −0.004 |
+| amritsar | 151 *(in belt)* | +0.223 | −0.012 |
+| chennai | 1,992 | +0.109 | −0.013 |
 
-Smoke transport cannot produce that ordering. Mumbai, 1,302 km away, correlates more
-strongly than either city inside the belt. What the column actually measures is a
-north–south split: the northern cities share a winter in which burning and trapped air
-peak together, while Bengaluru and Chennai, in a different climate, track neither.
-Mumbai is the control that gives it away.
+Smoke transport cannot produce that ordering. Mumbai, 1,302 km away, correlates as
+strongly as anything inside the belt, and Bengaluru at 1,958 km nearly matches Delhi.
+The deseasonalised column settles it: **every city collapses toward zero**, the two
+inside the belt to −0.004 and −0.012. The entire apparent relationship was the shared
+calendar. Mumbai was the control that gave it away; deseasonalising is the proof.
 
 There is a second, independent reason the number cannot carry weight. CAMS is fed by
 the Global Fire Assimilation System, which assimilates **MODIS and VIIRS active-fire
@@ -450,6 +491,11 @@ pipeline does not have historically, plus transport modelling it does not do.
 - **AQI category is derived from the aggregate it labels.** `aqi_category` is computed
   from the aggregated `aqi_max`, not reduced from per-station categories — a mode over
   per-station labels can contradict the max it sits beside.
+- **A seasonal confound cannot be flagged away, only subtracted.** Fire, temperature,
+  humidity and urban PM2.5 all follow the calendar, so raw correlations between them
+  largely measure the time of year. Deseasonalising needs complete years: with a
+  four-month window the climatology cannot be built, and the pooled number is all you
+  have. Load every month before trusting any correlation in this repo.
 - **AQI is computed on the scale the row is actually on.** WAQI's `iaqi` values,
   which feed `cleaned_cpcb`, are already AQI sub-indices on the 0–500 scale — the
   API's overall `aqi` equals `iaqi[dominentpol]` exactly, which is how you can tell.
