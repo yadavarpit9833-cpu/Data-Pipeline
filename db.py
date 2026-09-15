@@ -33,8 +33,17 @@ def get_db_connection():
             password=os.getenv('DB_PASSWORD', 'your_password')
         )
     else:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
+        # timeout + busy_timeout: the scheduler and any backfill can be writing
+        # at the same time, and SQLite's 5-second default surfaces that as
+        # "database is locked" rather than waiting for the other writer to
+        # finish. WAL lets readers work while one writer holds the lock.
+        conn = sqlite3.connect(SQLITE_DB_PATH, timeout=120)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute('PRAGMA busy_timeout = 120000')
+            conn.execute('PRAGMA journal_mode = WAL')
+        except Exception:
+            pass
         return conn
 
 def execute_query(cursor, query, params=()):

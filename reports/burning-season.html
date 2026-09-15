@@ -2,31 +2,32 @@
   India Burning Season - static report.
 
   Figures are baked into this file, so it is a snapshot, not a live view.
-  Built from the pipeline database on 2026-09-15:
+  Built from the pipeline database on 2026-09-15, all twelve months 2020-2025:
 
-      1,502,393 FIRMS detections   (backfill_firms.py)
-        194,832 weather hours      (backfill_weather.py, 13 stations)
-         88,512 CAMS air quality   (backfill_airquality.py, 8 cities)
+      6,307,169 FIRMS detections   (backfill_firms.py, 2,191 days)
+        683,904 weather hours      (backfill_weather.py, 13 stations)
+        239,192 CAMS air quality   (backfill_airquality.py, 8 cities, 2022-08 on)
 
-  To refresh after the database changes, re-run:
+  To refresh after the database changes, re-run analyze_fire_weather.py and the
+  deseasonalising analysis, then update the DATA, DAILY, RAIN, PM, MONTHS12 and
+  DESEASON constants in the script block below. Opens directly in a browser.
 
-      python analyze_fire_weather.py --station Delhi|Amritsar|Patiala
+  Three findings the page deliberately frames as negative or corrected:
+    - March and April carry three times the fire of October and November. An
+      earlier version covered only Jan/Oct/Nov/Dec and missed the larger season
+      entirely.
+    - Most of the rain-suppression effect was seasonal. Deseasonalised, rainfall
+      keeps about a third of its apparent strength; humidity is the real driver
+      at 58%, and temperature - which reads +0.001 raw - becomes +0.157.
+    - The city PM2.5 correlation is not smoke transport. Deseasonalised, every
+      city collapses to near zero, the two inside the belt to -0.004 and -0.012.
+      CAMS is also fed by GFAS, which assimilates the same MODIS and VIIRS
+      observations behind the detection counts, so even the raw figure was
+      partly circular.
 
-  and update the DATA, DAILY, RAIN, RHO and PM constants in the script block
-  below. Open the file directly in a browser - no server, no build step.
-
-  Two findings the page deliberately does NOT overclaim:
-    - The city PM2.5 correlation is not evidence of smoke transport. Mumbai at
-      1,302 km correlates more strongly than Patiala at 63 km; what the data
-      shows is a shared winter season, not smoke arriving.
-    - CAMS is fed by GFAS, which assimilates MODIS and VIIRS active-fire
-      observations - the same sensors behind the detection counts. Correlating
-      the two is partly circular by construction.
-
-  Palette: dataviz categorical slots 1-4, validated for colour-vision deficiency
-  in both light and dark modes. The dumbbell uses two categorical slots rather
-  than two shades of one hue: the dark-mode lightness band (L 0.48-0.67) is too
-  narrow for two steps of a single hue to stay apart.
+  Palette: dataviz categorical slots, validated for colour-vision deficiency in
+  both light and dark modes, including the slot-1/slot-3 pair used for the
+  raw-versus-deseasonalised bars.
 -->
 <title>India Burning Season</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap">
@@ -242,44 +243,61 @@ tfoot td {
     <div class="eyebrow">
       <span>NASA FIRMS &middot; VIIRS SNPP + MODIS</span>
       <span>6&deg;&ndash;37&deg;N, 68&deg;&ndash;97&deg;E</span>
+      <span>2020&ndash;2025, every month</span>
     </div>
     <h1>India Burning Season</h1>
     <p class="standfirst">
-      Every active-fire detection over India in January, October, November and December,
-      2020 through 2025 &mdash; <strong>1,502,393</strong> of them. November carries the season
-      every year, and the peak has been falling since 2021.
+      <strong>6,307,169</strong> active-fire detections over India across six full years.
+      The season everyone names is the stubble burning of October and November &mdash; but it
+      is the smaller of two. <strong>March and April carry three times as much fire</strong>,
+      every year without exception.
     </p>
   </header>
 
   <div class="stats">
     <div class="stat">
       <div class="k">Total detections</div>
-      <div class="v">1,502,393</div>
-      <div class="n">24 months, 738 days</div>
+      <div class="v">6,307,169</div>
+      <div class="n">2,191 days, 2020&ndash;2025</div>
     </div>
     <div class="stat">
-      <div class="k">November share</div>
-      <div class="v">37.8<span style="font-size:17px">%</span></div>
-      <div class="v" style="display:none"></div>
-      <div class="n">568,399 in one month of four</div>
+      <div class="k">March + April</div>
+      <div class="v">3,359,545</div>
+      <div class="n">53% of all fire, in two months</div>
     </div>
     <div class="stat">
-      <div class="k">October, 2020 &rarr; 2025</div>
-      <div class="v" style="color:var(--s2)">&minus;60<span style="font-size:17px">%</span></div>
-      <div class="n">69,459 down to 27,602</div>
+      <div class="k">October + November</div>
+      <div class="v" style="color:var(--s2)">826,763</div>
+      <div class="n">the stubble season &mdash; 13%</div>
     </div>
     <div class="stat">
-      <div class="k">Busiest single day</div>
-      <div class="v">10,186</div>
-      <div class="n">5 Nov 2021 &mdash; 2025&rsquo;s peak was 4,944</div>
+      <div class="k">Peak month, every year</div>
+      <div class="v">Mar<span style="font-size:17px">&thinsp;/&thinsp;</span>Apr</div>
+      <div class="n">6 of 6 years; never November</div>
     </div>
   </div>
 
   <section>
+    <h2>Two seasons, not one</h2>
+    <p class="sub">
+      Detections by calendar month, summed over six years. The forest-fire season in
+      March and April dwarfs the stubble burning in October and November, and the
+      monsoon months are close to empty. An earlier version of this page looked only at
+      January, October, November and December &mdash; which is how the larger season went
+      unseen.
+    </p>
+    <div class="figure">
+      <svg id="months" viewBox="0 0 860 300" role="img"
+           aria-label="Bar chart of fire detections by calendar month, summed over 2020 to 2025."></svg>
+    </div>
+  </section>
+
+  <section>
     <h2>Detections by month, year over year</h2>
     <p class="sub">
-      Each line follows one month across six years. November sits far above the rest and
-      falls after 2021; October declines in every single year of the series.
+      The four months the original window covered, each followed across six years.
+      November sits above the other three and falls after 2021; October declines in
+      every year of the series. Neither is the year's peak &mdash; March is.
     </p>
     <div class="figure">
       <div class="legend" id="legend"></div>
@@ -321,28 +339,36 @@ tfoot td {
       </div>
     </div>
     <p class="sub" style="margin-top:14px">
-      The effect is weakest at Delhi&rsquo;s 0.14 ratio and strongest there only because Delhi
-      records the fewest wet days of the three. Amritsar, inside the belt and with the most
-      rain, gives 0.20 &mdash; so treat that as the honest figure.
+      Measured inside October and November only, this looked like the strongest signal in
+      the data. With all twelve months loaded it turns out most of it was the calendar:
+      deseasonalised, rainfall keeps only about a third of its apparent strength. The
+      section below shows what survives.
     </p>
   </section>
 
   <section>
-    <h2>Does it hold every year?</h2>
+    <h2>What survives once the calendar is removed</h2>
     <p class="sub">
-      Rank correlation between daily rainfall and daily detections, per station per year.
-      A correlation is only worth trusting if its sign stays put; bars left of the line are
-      negative, meaning more rain went with fewer fires.
+      Fire and weather both follow the seasons, so a raw correlation between them largely
+      measures the time of year. With six complete years it can be subtracted: build a
+      day-of-year climatology, take the anomaly &mdash; how far each day sits from its own
+      normal &mdash; and correlate those instead. What is left is the part the calendar does
+      not explain.
     </p>
     <div class="figure">
-      <svg id="rhogrid" viewBox="0 0 860 584" role="img"
-           aria-label="Small bar chart grid of rainfall-fire rank correlation per station per year."></svg>
+      <svg id="deseason" viewBox="0 0 860 260" role="img"
+           aria-label="Paired bars comparing raw and deseasonalised correlation for temperature, humidity, rainfall and wind speed."></svg>
+      <div class="legend" style="padding-top:12px">
+        <div class="lg"><span class="sw" style="background:var(--s3);height:11px;width:11px;border-radius:2px"></span>raw</div>
+        <div class="lg"><span class="sw" style="background:var(--s1);height:11px;width:11px;border-radius:2px"></span>deseasonalised</div>
+      </div>
     </div>
     <p class="sub" style="margin-top:14px">
-      Patiala is negative in all six years. Delhi has no bar for 2024 because no rain fell
-      there at all that October or November, so the correlation is undefined rather than
-      missing. Amritsar&rsquo;s 2022 and 2024 sit near zero &mdash; the signal is directionally
-      consistent but not uniformly strong.
+      <strong>Humidity is the real driver</strong>, keeping 58% of its strength. Rainfall
+      keeps about a third &mdash; still real, but far less than it looked. And temperature
+      does the opposite: raw it reads <em>+0.001</em>, apparently nothing, because two
+      opposing seasonal effects cancel. Remove the season and it becomes <em>+0.157</em>.
+      A four-month window could not have found that.
     </p>
   </section>
 
@@ -360,16 +386,11 @@ tfoot td {
            aria-label="Scatter plot of distance from the burning belt against correlation between city PM2.5 and belt fire detections, for eight cities."></svg>
     </div>
     <p class="sub" style="margin-top:14px">
-      It does not hold. <strong>Mumbai, 1,302&nbsp;km away, correlates more strongly than any
-      city in the belt itself</strong> &mdash; more than Patiala at 63&nbsp;km and Amritsar at
-      151&nbsp;km. What the chart actually shows is a north&ndash;south split: the northern
-      cities share a winter season in which both burning and trapped air peak together,
-      while Bengaluru and Chennai, in a different climate, track neither.
-    </p>
-    <p class="sub" style="margin-top:10px">
-      So this is co-occurrence in a season, not smoke arriving somewhere. Mumbai is the
-      control that gives it away, and it is the reason the chart is here rather than a
-      headline about stubble smoke reaching Delhi.
+      It does not hold. <strong>Mumbai, 1,302&nbsp;km away, correlates as strongly as anything
+      in the belt itself.</strong> Hollow markers show the same correlation after the
+      day-of-year climatology is removed: every city collapses to near zero, the two inside
+      the belt to <em>&minus;0.004</em> and <em>&minus;0.012</em>. The entire apparent
+      relationship was the shared calendar.
     </p>
     <div class="figure" style="border-color:var(--s2); margin-top:20px">
       <div style="padding:4px 6px 12px">
@@ -381,8 +402,7 @@ tfoot td {
           by the Global Fire Assimilation System, which ingests
           <strong>MODIS and VIIRS active-fire observations</strong>: the same two sensors
           supplying the detection counts on the other axis. The model was told where the
-          fires were. A correlation between the two is partly circular by construction,
-          whatever the geography says.
+          fires were. Even the raw correlation was partly circular by construction.
         </p>
       </div>
     </div>
@@ -679,93 +699,36 @@ const RAIN = [
   });
 })();
 
-/* ---------- rainfall rho per station per year ---------- */
-const RHO = {
-  Delhi:    { 2020: -0.389, 2021: -0.552, 2022: -0.280, 2023: -0.463, 2024: null,  2025: -0.382 },
-  Amritsar: { 2020: -0.384, 2021: -0.405, 2022: -0.044, 2023: -0.398, 2024: 0.012, 2025: -0.246 },
-  Patiala:  { 2020: -0.389, 2021: -0.320, 2022: -0.496, 2023: -0.293, 2024: -0.198, 2025: -0.354 }
-};
-(function rhogrid() {
-  // Layout note: an earlier version anchored each value label to the end of its
-  // own bar. At rho -0.55 the bar nearly fills the track, so the label collided
-  // with the year label beside it. Values now live in their own right-hand
-  // column, which cannot collide however long a bar gets.
-  const svg = document.getElementById("rhogrid");
-  const W = 860, YEARLBL = 96, VALCOL = 84;
-  const zero = W - VALCOL - 26;            // bars grow leftwards from here
-  const track = zero - YEARLBL - 14;
-  const T = 40, rowH = 26, gapS = 26;
-  const SCALE = 0.6;                       // |rho| 0.6 fills the track
-  const x = v => zero + (track * v) / SCALE;
-  const names = Object.keys(RHO);
-
-  const lbl = el("text", { x: YEARLBL, y: 18, class: "smnote" });
-  lbl.textContent = "Spearman rho, rainfall vs detections \u2014 0 at the line, negative to the left";
-  svg.appendChild(lbl);
-
-  let y = T;
-  names.forEach((st, si) => {
-    const blockTop = y;
-    const h = el("text", { x: 0, y: y - 9, class: "smtitle" });
-    h.textContent = st;
-    svg.appendChild(h);
-
-    YEARS.forEach(yr => {
-      const v = RHO[st][yr];
-      const yl = el("text", { x: YEARLBL, y: y + 11, class: "axis-lbl", "text-anchor": "end" });
-      yl.textContent = yr;
-      svg.appendChild(yl);
-
-      if (v === null || v === undefined) {
-        const t = el("text", { x: zero - track, y: y + 11, class: "smnote" });
-        t.textContent = "no rain fell \u2014 undefined";
-        svg.appendChild(t);
-        const d = el("text", { x: W, y: y + 11, class: "smnote", "text-anchor": "end" });
-        d.textContent = "\u2014";
-        svg.appendChild(d);
-      } else {
-        const x0 = Math.min(zero, x(v)), w = Math.abs(x(v) - zero);
-        svg.appendChild(el("rect", { x: x0, y: y + 3, width: Math.max(w, 1.5), height: 11,
-                                     rx: 2, fill: "var(--s1)" }));
-        const t = el("text", { x: W, y: y + 12, class: "smnote", "text-anchor": "end",
-                               fill: "var(--ink-2)" });
-        t.textContent = v.toFixed(3);
-        svg.appendChild(t);
-      }
-      y += rowH;
-    });
-
-    svg.appendChild(el("line", { x1: zero, x2: zero, y1: blockTop, y2: y - 3,
-                                 stroke: "var(--ink-3)", "stroke-width": 1 }));
-    if (si < names.length - 1) y += gapS;
-  });
-})();
-
 /* ---------- distance from the belt vs PM2.5 correlation ---------- */
+// rho = raw; des = after subtracting the day-of-year climatology.
+// Recomputed on the full twelve-month dataset, so the raw figures differ
+// slightly from the October-November-only version this page first carried.
 const PM = [
-  { city: "patiala",   km: 63,   rho: 0.168 },
-  { city: "amritsar",  km: 151,  rho: 0.209 },
-  { city: "delhi",     km: 253,  rho: 0.318 },
-  { city: "lucknow",   km: 650,  rho: 0.305 },
-  { city: "mumbai",    km: 1302, rho: 0.350 },
-  { city: "kolkata",   km: 1532, rho: 0.187 },
-  { city: "bengaluru", km: 1958, rho: 0.087 },
-  { city: "chennai",   km: 1992, rho: 0.074 }
+  { city: "patiala",   km: 63,   rho: 0.287, des: -0.004 },
+  { city: "amritsar",  km: 151,  rho: 0.223, des: -0.012 },
+  { city: "delhi",     km: 253,  rho: 0.320, des:  0.064 },
+  { city: "lucknow",   km: 650,  rho: 0.384, des:  0.065 },
+  { city: "mumbai",    km: 1302, rho: 0.342, des:  0.124 },
+  { city: "kolkata",   km: 1532, rho: 0.301, des: -0.040 },
+  { city: "bengaluru", km: 1958, rho: 0.340, des: -0.016 },
+  { city: "chennai",   km: 1992, rho: 0.109, des: -0.013 }
 ];
 (function scatter() {
   const svg = document.getElementById("scatter");
   const W = 860, H = 400, L = 66, R = 26, T = 26, B = 58;
   const iw = W - L - R, ih = H - T - B;
-  const xMax = 2100, yMax = 0.40;
+  const xMax = 2100, yMin = -0.10, yMax = 0.42;
   const x = v => L + (iw * v) / xMax;
-  const y = v => T + ih - (ih * v) / yMax;
+  const y = v => T + ih - (ih * (v - yMin)) / (yMax - yMin);
 
-  for (let v = 0; v <= 0.40; v += 0.10) {
+  for (let v = -0.10; v <= 0.40 + 1e-9; v += 0.10) {
     svg.appendChild(el("line", { x1: L, x2: L + iw, y1: y(v), y2: y(v), class: "gridline" }));
     const t = el("text", { x: L - 10, y: y(v) + 4, class: "axis-lbl", "text-anchor": "end" });
     t.textContent = v.toFixed(2);
     svg.appendChild(t);
   }
+  svg.appendChild(el("line", { x1: L, x2: L + iw, y1: y(0), y2: y(0),
+                               stroke: "var(--ink-3)", "stroke-width": 1 }));
   [0, 500, 1000, 1500, 2000].forEach(v => {
     const t = el("text", { x: x(v), y: T + ih + 22, class: "axis-lbl", "text-anchor": "middle" });
     t.textContent = v === 0 ? "0" : v.toLocaleString("en-US");
@@ -787,6 +750,10 @@ const PM = [
   svg.appendChild(bl);
 
   PM.forEach(p => {
+    svg.appendChild(el("line", { x1: x(p.km), y1: y(p.rho), x2: x(p.km), y2: y(p.des),
+                                 stroke: "var(--ink-3)", "stroke-width": 1, opacity: .45 }));
+    svg.appendChild(el("circle", { cx: x(p.km), cy: y(p.des), r: 5,
+                                   fill: "var(--surface)", stroke: "var(--s1)", "stroke-width": 2 }));
     svg.appendChild(el("circle", { cx: x(p.km), cy: y(p.rho), r: 6,
                                    fill: "var(--s1)", stroke: "var(--surface)", "stroke-width": 2 }));
     // Nudge the labels that would otherwise collide: lucknow sits just under
@@ -799,14 +766,115 @@ const PM = [
     svg.appendChild(t);
   });
 
-  // Call out the pair that breaks the transport story.
-  const mum = PM.find(p => p.city === "mumbai"), pat = PM.find(p => p.city === "patiala");
-  svg.appendChild(el("line", { x1: x(pat.km), y1: y(pat.rho), x2: x(mum.km), y2: y(mum.rho),
-                               stroke: "var(--s2)", "stroke-width": 1.5,
-                               "stroke-dasharray": "5 4", opacity: .75 }));
-  const note = el("text", { x: x(760), y: y(0.222), class: "smnote", fill: "var(--s2)",
+  const k1 = el("text", { x: L + iw - 6, y: y(0.40), class: "smnote", fill: "var(--s1)",
+                          "text-anchor": "end" });
+  k1.textContent = "filled = raw";
+  svg.appendChild(k1);
+  const k2 = el("text", { x: L + iw - 6, y: y(0.40) + 14, class: "smnote", fill: "var(--ink-3)",
+                          "text-anchor": "end" });
+  k2.textContent = "hollow = deseasonalised";
+  svg.appendChild(k2);
+  const note = el("text", { x: x(1050), y: y(-0.062), class: "smnote", fill: "var(--s2)",
                             "text-anchor": "middle" });
-  note.textContent = "farther away, yet correlates more strongly";
+  note.textContent = "every city collapses to the zero line";
   svg.appendChild(note);
+})();
+
+/* ---------- month profile: the two seasons ---------- */
+const MONTHS12 = [
+  ["Jan",  326887], ["Feb",  667033], ["Mar", 1813503], ["Apr", 1546042],
+  ["May",  553468], ["Jun",  115186], ["Jul",   31307], ["Aug",   31949],
+  ["Sep",   46288], ["Oct",  258364], ["Nov",  568399], ["Dec",  348743]
+];
+(function monthProfile() {
+  const svg = document.getElementById("months");
+  const W = 860, H = 300, L = 58, R = 20, T = 34, B = 46;
+  const iw = W - L - R, ih = H - T - B;
+  const max = 1900000;
+  const bw = iw / MONTHS12.length;
+  const y = v => T + ih - (ih * v) / max;
+
+  for (let v = 0; v <= max; v += 500000) {
+    svg.appendChild(el("line", { x1: L, x2: L + iw, y1: y(v), y2: y(v), class: "gridline" }));
+    const t = el("text", { x: L - 10, y: y(v) + 4, class: "axis-lbl", "text-anchor": "end" });
+    t.textContent = v === 0 ? "0" : (v / 1000000).toFixed(1) + "m";
+    svg.appendChild(t);
+  }
+
+  MONTHS12.forEach((m, i) => {
+    const [name, v] = m;
+    // Orange marks the stubble season the page originally covered; the forest
+    // season gets the neutral series colour so the size contrast carries it.
+    const stubble = (name === "Oct" || name === "Nov");
+    const bx = L + i * bw + 3;
+    svg.appendChild(el("rect", { x: bx, y: y(v), width: bw - 6, height: (T + ih) - y(v),
+                                 rx: 3, fill: stubble ? "var(--s2)" : "var(--s1)" }));
+    const lb = el("text", { x: bx + (bw - 6) / 2, y: T + ih + 18, class: "axis-lbl",
+                            "text-anchor": "middle" });
+    lb.textContent = name;
+    svg.appendChild(lb);
+    if (v > 400000) {
+      const vt = el("text", { x: bx + (bw - 6) / 2, y: y(v) - 7, class: "smnote",
+                              "text-anchor": "middle", fill: "var(--ink-2)" });
+      vt.textContent = (v / 1000).toFixed(0) + "k";
+      svg.appendChild(vt);
+    }
+  });
+
+  const a = el("text", { x: L, y: 18, class: "smnote" });
+  a.textContent = "detections 2020-2025, summed by calendar month";
+  svg.appendChild(a);
+  const b = el("text", { x: L + iw, y: 18, class: "smnote", "text-anchor": "end",
+                         fill: "var(--s2)" });
+  b.textContent = "orange = the stubble season";
+  svg.appendChild(b);
+})();
+
+/* ---------- raw vs deseasonalised, fire x weather ---------- */
+const DESEASON = [
+  { v: "humidity",   raw: -0.554, des: -0.320 },
+  { v: "rainfall",   raw: -0.553, des: -0.179 },
+  { v: "temp",       raw:  0.001, des:  0.157 },
+  { v: "wind speed", raw:  0.040, des:  0.107 }
+];
+(function deseasonChart() {
+  const svg = document.getElementById("deseason");
+  const W = 860, H = 260, L = 108, R = 30, T = 34, B = 40;
+  const iw = W - L - R, ih = H - T - B;
+  const rowH = ih / DESEASON.length;
+  const lim = 0.6;
+  const zero = L + iw / 2;
+  const x = v => zero + (iw / 2) * v / lim;
+
+  [-0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6].forEach(v => {
+    svg.appendChild(el("line", { x1: x(v), x2: x(v), y1: T - 8, y2: T + ih,
+                                 stroke: v === 0 ? "var(--ink-3)" : "var(--grid)",
+                                 "stroke-width": 1 }));
+    const t = el("text", { x: x(v), y: T + ih + 20, class: "axis-lbl", "text-anchor": "middle" });
+    t.textContent = v.toFixed(1);
+    svg.appendChild(t);
+  });
+  const cap = el("text", { x: L, y: 18, class: "smnote" });
+  cap.textContent = "Spearman rho against daily belt detections, 2020-2025";
+  svg.appendChild(cap);
+
+  DESEASON.forEach((d, i) => {
+    const yTop = T + i * rowH + 8;
+    const nm = el("text", { x: L - 14, y: yTop + 17, class: "dlabel", fill: "var(--ink)",
+                            "text-anchor": "end" });
+    nm.textContent = d.v;
+    svg.appendChild(nm);
+
+    [["raw", d.raw, "var(--s3)", 0], ["des", d.des, "var(--s1)", 13]].forEach(([, val, col, off]) => {
+      const x0 = Math.min(zero, x(val)), w = Math.abs(x(val) - zero);
+      svg.appendChild(el("rect", { x: x0, y: yTop + off, width: Math.max(w, 1.5), height: 11,
+                                   rx: 2, fill: col }));
+      const t = el("text", { x: val < 0 ? x0 - 7 : x0 + w + 7, y: yTop + off + 9,
+                             class: "smnote", "text-anchor": val < 0 ? "end" : "start",
+                             fill: "var(--ink-2)" });
+      t.textContent = val.toFixed(3);
+      svg.appendChild(t);
+    });
+  });
 })();
 </script>
