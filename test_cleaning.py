@@ -165,5 +165,48 @@ class TestGribScaleFactors(unittest.TestCase):
         self.assertAlmostEqual(0.0 + 655 * 2.0 ** good, 40.9375)
 
 
+class TestApcpIncrements(unittest.TestCase):
+    """
+    GFS ships APCP as a bucket that resets every 6 hours, so a 3-hourly series has
+    to be differenced out of alternating 3-hour and 6-hour windows. Getting this
+    wrong produces a rainfall series that looks entirely plausible.
+    """
+
+    def _frame(self, fhrs, points=2):
+        import pandas as pd
+        return pd.DataFrame([{'fhr': f, 'lat': 28.0 + i, 'lon': 77.0}
+                             for f in fhrs for i in range(points)])
+
+    def test_three_hour_bucket_passes_through(self):
+        from fetch_gfs_forecast import to_3h_increments
+        df, _ = to_3h_increments(self._frame([3]), {3: {'values': [1.0, 2.0], 'span': 3}})
+        self.assertEqual(df['precipitation_mm_3h'].tolist(), [1.0, 2.0])
+
+    def test_six_hour_bucket_is_differenced(self):
+        from fetch_gfs_forecast import to_3h_increments
+        buckets = {3: {'values': [1.0, 2.0], 'span': 3},
+                   6: {'values': [4.0, 2.5], 'span': 6}}
+        df, notes = to_3h_increments(self._frame([3, 6]), buckets)
+        # f006 carries 0-6h; the 3-6h increment is that minus the 0-3h bucket.
+        self.assertEqual(df['precipitation_mm_3h'].tolist(), [1.0, 2.0, 3.0, 0.5])
+        self.assertTrue(any('minus' in n for n in notes))
+
+    def test_analysis_hour_stays_null(self):
+        from fetch_gfs_forecast import to_3h_increments
+        df, _ = to_3h_increments(self._frame([0, 3]),
+                                 {0: {'values': None, 'span': None},
+                                  3: {'values': [1.0, 2.0], 'span': 3}})
+        self.assertTrue(df[df.fhr == 0]['precipitation_mm_3h'].isna().all())
+
+    def test_negative_increment_refuses_to_write(self):
+        from fetch_gfs_forecast import to_3h_increments
+        # A 6-hour bucket smaller than the 3-hour bucket inside it is impossible;
+        # it means the two windows were mismatched.
+        buckets = {3: {'values': [5.0, 5.0], 'span': 3},
+                   6: {'values': [1.0, 1.0], 'span': 6}}
+        with self.assertRaises(ValueError):
+            to_3h_increments(self._frame([3, 6]), buckets)
+
+
 if __name__ == '__main__':
     unittest.main()

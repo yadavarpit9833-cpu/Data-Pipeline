@@ -420,6 +420,60 @@ Fault 2 is fixed (`grib_signed()` in `fetch_gfs.py`, covered by three tests). Fa
 is not: moving to f003 changes the table from analysis to forecast, which is a
 modelling decision, not a bug fix. Until it is made, treat precipitation as absent.
 
+## Forecast runs — `fetch_gfs_forecast.py`
+
+`cleaned_gfs` holds forecast hour 000 and nothing else: `fetch_gfs.py` requests one
+file per cycle, so the table is a sequence of analysis hours, not a forecast. There
+is no `fhr > 0` in the database to export. This script fetches a whole run — f000 to
+f072 at 3-hourly steps — and writes it straight to Parquet:
+
+```bash
+python fetch_gfs_forecast.py --bbox 28.2 28.9 76.8 77.6 --out exports/gfs_ncr_forecast.parquet
+```
+
+`exports/gfs_ncr_forecast.parquet` is checked in: 9 NCR grid points × 25 steps = 225
+rows, same unit-suffixed column names as the extract above plus `precipitation_mm_3h`.
+It picks the newest cycle whose f072 is published, or takes `--cycle YYYYMMDDHH`.
+
+### Three ways these files lie to a naive reader
+
+All three are silent — nothing errors, and the output looks reasonable:
+
+**TMP appears twice per file.** Surface skin temperature (fixed-surface type 1) and
+2 m air temperature (type 103, level 2). `fetch_gfs.py` keys on the GRIB parameter
+alone and lets the last record win, so which one it stores depends on the order NCEP
+happened to write them. It gets 2 m today by luck. This script selects on parameter
+**and** level.
+
+**APCP appears twice per file, with different windows.** One record is the bucket
+since the last 6-hour boundary, the other is the run total since f000. Last-wins takes
+the run total — a series that only ever increases, which reads as relentless rain.
+
+**The bucket is not always 3 hours.** At f006, f012, f018 … it spans 6 hours, not 3:
+
+| file | short record | file | short record |
+|---|---|---|---|
+| f003 | 0–3 h | f006 | 0–6 h |
+| f009 | 6–9 h | f012 | 6–12 h |
+| f015 | 12–15 h | f018 | 12–18 h |
+
+So the 6-hourly steps are differenced against the 3-hour bucket before them.
+`precipitation_mm_3h` is therefore always the accumulation over the **3 hours ending
+at `valid_time`**, and f000 is `NULL` with `qc_flag = 'no_accumulation_window'` — the
+analysis hour has no interval to have rained in. The QC imputer will happily
+interpolate rain into it if you let it; the script puts the null back afterwards.
+
+**The differencing is checked, not assumed.** The run-total record the script
+deliberately discards is used at f072 as an independent reconciliation: the 3-hourly
+increments must sum back to it at every grid point. On the committed run they agree
+to within one or two quanta of the 1/16 mm packing — the most that 24 differenced
+buckets can be expected to close to. A wider gap aborts the write.
+
+These rows are **not** inserted into `cleaned_gfs`. Folding them in would put two
+different quantities in `precipitation_clean` — a 3-hour bucket for forecast rows, a
+hardcoded zero for the f000 rows already there — with no column saying which. That
+needs a `precipitation_window_h` column on the table first.
+
 ### The committed NCR extract
 
 `exports/gfs_ncr.parquet` is checked in — Delhi NCR, `wide`, regenerated with:
@@ -618,8 +672,8 @@ Parquet writes use read-merge-write with the same dedup keys, then an atomic ren
 python -m unittest test_cleaning test_idempotency
 ```
 
-29 tests: the QC chain, the gold AQI scale rules and GRIB2 scale-factor decoding
-(`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
+33 tests: the QC chain, the gold AQI scale rules, GRIB2 scale-factor decoding and
+APCP bucket differencing (`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
 (`test_idempotency.py`). The idempotency suite builds its test
 database from `schema.sql`, so any table must be declared there to be covered.
 
@@ -638,6 +692,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
 | `migrate_db.py` | Rebuild tables against the current schema |
 | `export_gfs_parquet.py` | Export `cleaned_gfs` to one Parquet file with a `unit` column |
+| `fetch_gfs_forecast.py` | Fetch a full f000–f072 GFS run, with real 3-hourly precipitation |
 | `migrate_sqlite_to_parquet.py` | Export existing SQLite rows into the Parquet lake |
 
 ## Known limitations
@@ -647,9 +702,14 @@ database from `schema.sql`, so any table must be declared there to be covered.
   backfilled. Raise `misfire_grace_time` on a job if you need catch-up behaviour.
 - **`is_synthetic` is row-level, not column-level**, so it cannot express a partial
   fallback where some fields are real and others synthetic.
-- **GFS carries no usable precipitation.** The fetcher asks for forecast hour 000,
-  where APCP does not exist, so the column is a constant `0.0`. See
-  [Why precipitation is all zeros](#why-precipitation-is-all-zeros).
+- **The scheduled GFS job carries no usable precipitation.** It asks for forecast
+  hour 000, where APCP does not exist, so `cleaned_gfs.precipitation_clean` is a
+  constant `0.0`. See [Why precipitation is all zeros](#why-precipitation-is-all-zeros).
+  `fetch_gfs_forecast.py` gets real precipitation, but writes Parquet rather than
+  into the table.
+- **`cleaned_gfs` has no forecast hours.** Every row is `fhr = 000`. The `fhr` column
+  and the `(lat, lon, cycle, fhr)` unique constraint anticipate more, but nothing
+  writes them.
 - **`fetch_sentinel5p.py` is not Sentinel-5P.** It queries
   `air-quality-api.open-meteo.com` (CAMS reanalysis, tagged `source='cams_open-meteo'`)
   on a 2° grid — 240 points, none of which fall inside Delhi NCR — and its `_ppb`
