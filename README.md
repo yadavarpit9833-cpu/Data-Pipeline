@@ -350,6 +350,59 @@ hold different quantities: WAQI gives AQI sub-indices, CAMS gives concentrations
 Units are CAMS's own throughout — µg/m³ including CO, where CPCB quotes mg/m³, so
 divide by 1000 before comparing.
 
+## Sharing GFS — `export_gfs_parquet.py`
+
+`cleaned_gfs` is wide: one column per variable, each in a different unit, with no
+room to say which. This writes the long form to a single Parquet file, one row per
+grid point per variable, with `value` and `unit` adjacent:
+
+```bash
+python export_gfs_parquet.py                                  # all of India
+python export_gfs_parquet.py --bbox 28.0 29.0 76.75 77.75     # Delhi NCR only
+python export_gfs_parquet.py --out somewhere/gfs.parquet
+```
+
+Output lands at `data/exports/cleaned_gfs.parquet`. Columns: `valid_time`, `cycle`,
+`fhr`, `lat`, `lon`, `variable`, `value`, `value_raw`, `unit`, `qc_flag`, `imputed`,
+`source`, `is_synthetic`, `fetched_at`. The unit map, the GRIB field each variable
+came from, the grid description and the caveats below are also written to the Parquet
+key-value metadata, so a consumer who never reads this file still gets them:
+
+```python
+import pyarrow.parquet as pq, json
+json.loads(pq.ParquetFile("data/exports/cleaned_gfs.parquet").schema_arrow.metadata[b"units"])
+# {'temperature': 'degC', 'u_wind': 'm s-1', 'v_wind': 'm s-1'}
+```
+
+Two things are withheld by default, because both look like data and are not:
+
+- **Synthetic rows.** When NOMADS has not published a cycle, `fetch_gfs.py` writes a
+  constant grid (25 °C, 1 m/s, 0 mm) tagged `is_synthetic`. `--include-synthetic`
+  keeps them.
+- **Precipitation.** Every APCP value in the table is exactly `0.0`.
+  `--include-precipitation` forces the column in anyway.
+
+### Why precipitation is all zeros
+
+Two independent faults, either of which alone is sufficient:
+
+1. **`fetch_gfs.py` requests forecast hour 000.** APCP is an accumulation over an
+   interval, so there is nothing to accumulate at f000 and NOMADS omits the field
+   entirely. The fetcher then falls back to `[0.0] * len(temps)` — a dry grid, not a
+   missing one. Verified by probing the same cycle at both hours: f000 returns
+   `TMP, UGRD, VGRD`; f003 returns those plus `APCP`.
+2. **GRIB2 scale factors are sign-magnitude, and the parser read two's complement.**
+   APCP is packed with a binary scale of −4, written `0x8004`. Read as two's
+   complement that is −32764, so `2 ** scale` underflowed to `0.0` and every value
+   collapsed onto the reference value regardless of its bits. Temperature and wind
+   were unaffected because their scale factors are positive, where both readings
+   agree. Decoded correctly, the same payload gives 0–40.9 mm/3h with rain in 52% of
+   Indian grid cells.
+
+Fault 2 is fixed (`grib_signed()` in `fetch_gfs.py`, covered by three tests). Fault 1
+is not: moving to f003 changes the table from analysis to forecast, which is a
+modelling decision, not a bug fix. Until it is made, treat precipitation as absent.
+
 ## Analysis
 
 `analyze_fire_weather.py` joins daily FIRMS detections inside a lat/lon box to one
@@ -533,8 +586,9 @@ Parquet writes use read-merge-write with the same dedup keys, then an atomic ren
 python -m unittest test_cleaning test_idempotency
 ```
 
-19 tests: the QC chain (`test_cleaning.py`) and database idempotency including GFS
-`valid_time` computation (`test_idempotency.py`). The idempotency suite builds its test
+29 tests: the QC chain, the gold AQI scale rules and GRIB2 scale-factor decoding
+(`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
+(`test_idempotency.py`). The idempotency suite builds its test
 database from `schema.sql`, so any table must be declared there to be covered.
 
 ## Utility scripts
@@ -551,6 +605,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `reports/burning-season.html` | Standalone report page built from the two backfills |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
 | `migrate_db.py` | Rebuild tables against the current schema |
+| `export_gfs_parquet.py` | Export `cleaned_gfs` to one Parquet file with a `unit` column |
 | `migrate_sqlite_to_parquet.py` | Export existing SQLite rows into the Parquet lake |
 
 ## Known limitations
@@ -560,6 +615,14 @@ database from `schema.sql`, so any table must be declared there to be covered.
   backfilled. Raise `misfire_grace_time` on a job if you need catch-up behaviour.
 - **`is_synthetic` is row-level, not column-level**, so it cannot express a partial
   fallback where some fields are real and others synthetic.
+- **GFS carries no usable precipitation.** The fetcher asks for forecast hour 000,
+  where APCP does not exist, so the column is a constant `0.0`. See
+  [Why precipitation is all zeros](#why-precipitation-is-all-zeros).
+- **`fetch_sentinel5p.py` is not Sentinel-5P.** It queries
+  `air-quality-api.open-meteo.com` (CAMS reanalysis, tagged `source='cams_open-meteo'`)
+  on a 2° grid — 240 points, none of which fall inside Delhi NCR — and its `_ppb`
+  columns hold µg/m³, not ppb. The table name, the file name and the column names all
+  misdescribe the contents.
 - **WAQI returns stale observation timestamps for some stations**, occasionally months
   old. These are stored at their reported time, so they land in older date partitions
   and will not join against current weather.

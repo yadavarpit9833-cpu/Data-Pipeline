@@ -1,6 +1,7 @@
 import unittest
 import pandas as pd
 import numpy as np
+from fetch_gfs import grib_signed
 from cleaning import (
     check_range,
     check_step,
@@ -133,6 +134,35 @@ class TestGoldAqiScale(unittest.TestCase):
     def test_all_nan_yields_nan(self):
         import gold_layer
         self.assertTrue(np.isnan(gold_layer._aqi_from(np.nan, np.nan, 'cpcb')))
+
+
+class TestGribScaleFactors(unittest.TestCase):
+    """
+    GRIB2 signed integers are sign-magnitude, not two's complement. Reading them
+    the wrong way silently zeroed every APCP value in the GFS grid.
+    """
+
+    def test_positive_scale_reads_the_same_either_way(self):
+        # Temperature and wind carry positive scale factors, where both readings
+        # agree - which is why the bug never surfaced in those fields.
+        for value in (0, 1, 2, 300):
+            raw = bytes([value >> 8, value & 0xFF])
+            self.assertEqual(grib_signed(raw), value)
+            self.assertEqual(grib_signed(raw), int.from_bytes(raw, 'big', signed=True))
+
+    def test_negative_scale_is_sign_magnitude(self):
+        # 0x8004 is -4 in sign-magnitude; two's complement would read -32764.
+        self.assertEqual(grib_signed(bytes([0x80, 0x04])), -4)
+        self.assertEqual(grib_signed(bytes([0x80, 0x01])), -1)
+
+    def test_apcp_scale_does_not_underflow(self):
+        # The actual failure: 2 ** -32764 is 0.0, so every packed APCP value
+        # collapsed onto the reference value of 0.0 regardless of its bits.
+        apcp_binary_scale = bytes([0x80, 0x04])
+        good = grib_signed(apcp_binary_scale)
+        bad = int.from_bytes(apcp_binary_scale, 'big', signed=True)
+        self.assertEqual(2.0 ** bad, 0.0)
+        self.assertAlmostEqual(0.0 + 655 * 2.0 ** good, 40.9375)
 
 
 if __name__ == '__main__':

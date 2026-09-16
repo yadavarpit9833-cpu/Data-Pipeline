@@ -43,6 +43,24 @@ def compute_valid_time(cycle_str, fhr_str):
     except Exception:
         return datetime.now(timezone.utc).isoformat()
 
+def grib_signed(raw):
+    """
+    GRIB2 stores signed integers as sign-magnitude (WMO Manual 306, Reg. 92.1.4):
+    the high bit is the sign, the remaining bits the magnitude. int.from_bytes(
+    signed=True) reads two's complement instead, which is only the same for
+    positive values.
+
+    BUGFIX: APCP is packed with a binary scale factor of -4, written as 0x8004.
+    Read as two's complement that is -32764, so 2 ** scale underflowed to 0.0
+    and every precipitation value in the grid decoded to exactly 0.0 - not NULL,
+    not an error, just a silently dry India. Temperature and wind were unaffected
+    because their scale factors are positive, where both readings agree.
+    """
+    v = int.from_bytes(raw, 'big')
+    bits = len(raw) * 8
+    sign_bit = 1 << (bits - 1)
+    return -(v & (sign_bit - 1)) if v & sign_bit else v
+
 def parse_grib2_subregion(content):
     """
     Pure Python GRIB2 parser for NOAA NOMADS subregion filter payload.
@@ -95,8 +113,8 @@ def parse_grib2_subregion(content):
             param = sec4[10]
             
             ref_val = struct.unpack('>f', sec5[11:15])[0]
-            bin_scale = int.from_bytes(sec5[15:17], 'big', signed=True)
-            dec_scale = int.from_bytes(sec5[17:19], 'big', signed=True)
+            bin_scale = grib_signed(sec5[15:17])
+            dec_scale = grib_signed(sec5[17:19])
             nbits = sec5[19]
             
             npoints = ni * nj
