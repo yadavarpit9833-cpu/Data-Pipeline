@@ -357,16 +357,33 @@ room to say which. This writes the long form to a single Parquet file, one row p
 grid point per variable, with `value` and `unit` adjacent:
 
 ```bash
-python export_gfs_parquet.py                                  # all of India
-python export_gfs_parquet.py --bbox 28.0 29.0 76.75 77.75     # Delhi NCR only
+python export_gfs_parquet.py                                  # all of India, long
+python export_gfs_parquet.py --format wide --bbox 28.2 28.9 76.8 77.6
 python export_gfs_parquet.py --out somewhere/gfs.parquet
 ```
 
-Output lands at `data/exports/cleaned_gfs.parquet`. Columns: `valid_time`, `cycle`,
-`fhr`, `lat`, `lon`, `variable`, `value`, `value_raw`, `unit`, `qc_flag`, `imputed`,
-`source`, `is_synthetic`, `fetched_at`. The unit map, the GRIB field each variable
-came from, the grid description and the caveats below are also written to the Parquet
-key-value metadata, so a consumer who never reads this file still gets them:
+Two shapes, both carrying the unit:
+
+| `--format` | Shape | Where the unit lives |
+|---|---|---|
+| `long` (default) | a row per grid point **per variable** | a `unit` column beside `value` |
+| `wide` | a row per grid point | the column name — `temperature_c`, `u_wind_ms` |
+
+`long` columns: `valid_time`, `cycle`, `fhr`, `lat`, `lon`, `variable`, `value`,
+`value_raw`, `unit`, `qc_flag`, `imputed`, `source`, `is_synthetic`, `fetched_at`.
+
+`wide` columns: `valid_time`, `cycle`, `fhr`, `lat`, `lon`, then per variable
+`<name>_<unit>`, `<name>_<unit>_raw`, `<name>_qc_flag`, `<name>_imputed`, then
+`source`, `is_synthetic`, `fetched_at`.
+
+**`temperature_c`, not `temperature_k`.** GFS ships TMP in Kelvin; `fetch_gfs.py`
+subtracts 273.15 at parse time, so the stored value is Celsius and the name says so.
+In `wide`, `valid_time` and `fetched_at` are ISO-8601 **text** with an explicit
+`+00:00` rather than Parquet timestamps, so no reader can quietly localise them.
+
+The unit map, the GRIB field each variable came from, the grid description and the
+caveats below are also written to the Parquet key-value metadata, so a consumer who
+never reads this file still gets them:
 
 ```python
 import pyarrow.parquet as pq, json
@@ -402,6 +419,21 @@ Two independent faults, either of which alone is sufficient:
 Fault 2 is fixed (`grib_signed()` in `fetch_gfs.py`, covered by three tests). Fault 1
 is not: moving to f003 changes the table from analysis to forecast, which is a
 modelling decision, not a bug fix. Until it is made, treat precipitation as absent.
+
+### The committed NCR extract
+
+`exports/gfs_ncr.parquet` is checked in — Delhi NCR, `wide`, regenerated with:
+
+```bash
+python export_gfs_parquet.py --format wide --bbox 28.2 28.9 76.8 77.6 --out exports/gfs_ncr.parquet
+```
+
+That box holds **9 of the 14,625 grid points** (lat 28.25/28.50/28.75, lon
+77.00/77.25/77.50). Note what that makes the file: 9 points × the cycles collected so
+far. `cleaned_gfs` is a live table with a few days in it, not an archive — at the time
+of writing, three cycles of which one is synthetic fallback, so **18 rows**. It grows by
+9 rows per real cycle. Everything under `data/` is gitignored; `exports/` is the one
+place a deliberately shared extract is tracked.
 
 ## Analysis
 

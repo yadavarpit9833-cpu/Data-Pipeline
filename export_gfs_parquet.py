@@ -32,12 +32,19 @@ DB_PATH = os.path.join(BASE_DIR, 'env_data.db')
 DEFAULT_OUT = os.path.join(BASE_DIR, 'data', 'exports', 'cleaned_gfs.parquet')
 
 # variable name -> cleaned_gfs column prefix, unit as written to the file, GRIB field.
-# Units use the UDUNITS spelling the CF conventions use, so they parse.
+# `unit` uses the UDUNITS spelling the CF conventions use, so it parses; `suffix`
+# is the short form appended to column names in --format wide, where the unit has
+# to survive in the name itself. temperature is degC and not the Kelvin GFS ships
+# because fetch_gfs.py subtracts 273.15 at parse time - hence _c, not _k.
 VARIABLES = {
-    'temperature':   {'prefix': 'temperature',   'unit': 'degC',  'grib': 'TMP 2 m above ground'},
-    'u_wind':        {'prefix': 'u_wind',        'unit': 'm s-1', 'grib': 'UGRD 10 m above ground'},
-    'v_wind':        {'prefix': 'v_wind',        'unit': 'm s-1', 'grib': 'VGRD 10 m above ground'},
-    'precipitation': {'prefix': 'precipitation', 'unit': 'mm',    'grib': 'APCP surface'},
+    'temperature':   {'prefix': 'temperature',   'unit': 'degC',  'suffix': 'c',
+                      'grib': 'TMP 2 m above ground (K in GRIB, converted to degC on ingest)'},
+    'u_wind':        {'prefix': 'u_wind',        'unit': 'm s-1', 'suffix': 'ms',
+                      'grib': 'UGRD 10 m above ground'},
+    'v_wind':        {'prefix': 'v_wind',        'unit': 'm s-1', 'suffix': 'ms',
+                      'grib': 'VGRD 10 m above ground'},
+    'precipitation': {'prefix': 'precipitation', 'unit': 'mm',    'suffix': 'mm',
+                      'grib': 'APCP surface'},
 }
 HELD_BACK = ('precipitation',)
 
@@ -110,6 +117,41 @@ def to_long(df, wanted):
     return out.sort_values(['valid_time', 'variable', 'lat', 'lon']).reset_index(drop=True)
 
 
+def to_wide(df, wanted):
+    """
+    One row per grid point, with the unit carried in the column name:
+    temperature_c, u_wind_ms, v_wind_ms. A consumer reading only the header still
+    knows temperature is Celsius rather than the Kelvin the GRIB actually ships.
+
+    valid_time and fetched_at stay ISO-8601 strings with an explicit +00:00 rather
+    than Parquet timestamps, so no reader can silently localise them.
+    """
+    out = pd.DataFrame({
+        'valid_time': iso_utc(df['valid_time']),
+        'cycle': df['cycle'].astype(str),
+        'fhr': df['fhr'].astype(int).astype('int16'),
+        'lat': df['lat'].astype('float64'),
+        'lon': df['lon'].astype('float64'),
+    })
+    for v in wanted:
+        p, sfx = VARIABLES[v]['prefix'], VARIABLES[v]['suffix']
+        out[f'{p}_{sfx}'] = df[f'{p}_clean'].astype('float64')
+        out[f'{p}_{sfx}_raw'] = df[f'{p}_raw'].astype('float64')
+        out[f'{p}_qc_flag'] = df[f'{p}_qc_flag'].fillna('ok').astype(str)
+        out[f'{p}_imputed'] = df[f'{p}_imputed'].fillna(0).astype(bool)
+    out['source'] = df['source'].astype(str)
+    out['is_synthetic'] = df['is_synthetic'].astype(bool)
+    out['fetched_at'] = iso_utc(df['fetched_at'])
+    return out.sort_values(['valid_time', 'lat', 'lon']).reset_index(drop=True)
+
+
+def iso_utc(series):
+    """ISO-8601 in UTC, written as text so nothing downstream can reinterpret it."""
+    ts = pd.to_datetime(series, utc=True, format='ISO8601')
+    return ts.dt.strftime('%Y-%m-%dT%H:%M:%S%z').str.replace(
+        r'([+-]\d{2})(\d{2})$', r'\1:\2', regex=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -120,7 +162,11 @@ def main():
                     help='keep the APCP column even though every value is 0.0')
     ap.add_argument('--bbox', nargs=4, type=float,
                     metavar=('LAT_MIN', 'LAT_MAX', 'LON_MIN', 'LON_MAX'),
-                    help='clip to a bounding box, e.g. Delhi NCR: 28.0 29.0 76.75 77.75')
+                    help='clip to a bounding box, e.g. Delhi NCR: 28.2 28.9 76.8 77.6')
+    ap.add_argument('--format', choices=('long', 'wide'), default='long',
+                    help="long: a row per grid point per variable, with a `unit` column. "
+                         "wide: a row per grid point, unit carried in the column name "
+                         "(temperature_c, u_wind_ms).")
     args = ap.parse_args()
 
     conn = sqlite3.connect(DB_PATH, timeout=180)
@@ -132,11 +178,18 @@ def main():
     if df.empty:
         raise SystemExit('cleaned_gfs returned no rows for those filters - nothing exported.')
 
-    long_df = to_long(df, wanted)
+    out_df = to_wide(df, wanted) if args.format == 'wide' else to_long(df, wanted)
 
-    table = pa.Table.from_pandas(long_df, preserve_index=False)
+    if args.format == 'wide':
+        units = {f"{VARIABLES[v]['prefix']}_{VARIABLES[v]['suffix']}": VARIABLES[v]['unit']
+                 for v in wanted}
+    else:
+        units = {v: VARIABLES[v]['unit'] for v in wanted}
+
+    table = pa.Table.from_pandas(out_df, preserve_index=False)
     meta = {
-        b'units': json.dumps({v: VARIABLES[v]['unit'] for v in wanted}).encode(),
+        b'units': json.dumps(units).encode(),
+        b'format': args.format.encode(),
         b'grib_fields': json.dumps({v: VARIABLES[v]['grib'] for v in wanted}).encode(),
         b'coordinate_units': json.dumps(
             {'lat': 'degrees_north', 'lon': 'degrees_east',
@@ -157,12 +210,12 @@ def main():
     pq.write_table(table, tmp, compression='zstd')
     os.replace(tmp, args.out)
 
-    print(f"wrote {args.out}  ({os.path.getsize(args.out):,} bytes, {len(long_df):,} rows)")
-    print(f"  grid rows in    : {len(df):,}")
-    print(f"  variables       : {', '.join(wanted)}")
-    print(f"  units           : {', '.join(VARIABLES[v]['unit'] for v in wanted)}")
+    print(f"wrote {args.out}  ({os.path.getsize(args.out):,} bytes, {len(out_df):,} rows)")
+    print(f"  format          : {args.format}")
+    print(f"  grid rows in    : {len(df):,}  ({df.groupby(['lat', 'lon']).ngroups} grid points)")
+    print(f"  units           : {json.dumps(units)}")
     print(f"  cycles          : {', '.join(sorted(df['cycle'].unique()))}")
-    print(f"  valid_time span : {long_df['valid_time'].min()} .. {long_df['valid_time'].max()}")
+    print(f"  valid_time span : {out_df['valid_time'].min()} .. {out_df['valid_time'].max()}")
     held = [v for v in HELD_BACK if v not in wanted]
     if held:
         print(f"  held back       : {', '.join(held)} (--include-precipitation to force)")
