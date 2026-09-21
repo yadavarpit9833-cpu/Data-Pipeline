@@ -118,9 +118,13 @@ Also carries the six `*_daily_mean` pollutant columns, `humidity_daily_mean`,
 
 | cycle | temp_mean | temp_max | precip_total | n_grid_points |
 |---|---|---|---|---|
-| 20260914_00z | 20.74 | 33.23 | 0.0 | 14625 |
+| 20260914_00z | 20.74 | 33.23 | *null* | 14625 |
 
 Also carries `valid_time`, `temp_min` and `wind_speed_mean`.
+
+`precip_total` is null on every cycle, and that is the honest answer: the scheduled
+fetcher only requests forecast hour 000, which carries no accumulation. It used to
+read `0.0`, which is the same claim a genuinely rainless day would make.
 
 ### Supporting modules
 
@@ -481,10 +485,11 @@ committed 21 Sep run is genuinely dry — every APCP field is a packed constant
 while the same decoder over all of India on the same cycle finds ~9,000 wet cells and
 up to 146 mm off the Bay of Bengal coast.
 
-These rows are **not** inserted into `cleaned_gfs`. Folding them in would put two
-different quantities in `precipitation_clean` — a 3-hour bucket for forecast rows, a
-hardcoded zero for the f000 rows already there — with no column saying which. That
-needs a `precipitation_window_h` column on the table first.
+These rows are **not** inserted into `cleaned_gfs` yet, but the obstacle is gone:
+`precipitation_window_h` now exists on both `raw_gfs` and `cleaned_gfs`, so a 3-hour
+forecast bucket and a window-less analysis row can live in the same column without
+being confused for one another. Wiring the forecast writer into the table is the
+remaining step.
 
 ### The committed NCR extract
 
@@ -642,6 +647,14 @@ pipeline does not have historically, plus transport modelling it does not do.
 - **AQI category is derived from the aggregate it labels.** `aqi_category` is computed
   from the aggregated `aqi_max`, not reduced from per-station categories — a mode over
   per-station labels can contradict the max it sits beside.
+- **A precipitation number without its accumulation window is unreadable.**
+  `cleaned_gfs.precipitation_window_h` says how many hours the value covers. GFS
+  APCP is a bucket, not a rate, and the bucket length varies with forecast hour —
+  3 h at f003/f009/f015, 6 h at f006/f012/f018 — so two rows are not comparable
+  until you have read it. `NULL` means there is no window and the precipitation
+  columns hold no measurement, with `precipitation_qc_flag =
+  'no_accumulation_window'` saying so. Every f000 row is in that state: the
+  analysis hour has no interval to accumulate over.
 - **A seasonal confound cannot be flagged away, only subtracted.** Fire, temperature,
   humidity and urban PM2.5 all follow the calendar, so raw correlations between them
   largely measure the time of year. Deseasonalising needs complete years: with a
@@ -684,9 +697,9 @@ Parquet writes use read-merge-write with the same dedup keys, then an atomic ren
 python -m unittest test_cleaning test_idempotency
 ```
 
-35 tests: the QC chain, the gold AQI scale rules, GRIB2 scale-factor decoding and
+37 tests: the QC chain, the gold AQI scale rules, GRIB2 scale-factor decoding and
 APCP bucket differencing including the dry-run guard (`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
-(`test_idempotency.py`). The idempotency suite builds its test
+and the precipitation window column (`test_idempotency.py`). The idempotency suite builds its test
 database from `schema.sql`, so any table must be declared there to be covered.
 
 ## Utility scripts
@@ -702,6 +715,7 @@ database from `schema.sql`, so any table must be declared there to be covered.
 | `analyze_fire_weather.py` | Correlate belt fire counts against station weather |
 | `reports/burning-season.html` | Standalone report page built from the two backfills |
 | `normalize_gfs_cycles.py` | Backfill/normalise GFS cycle labels |
+| `migrate_precip_window.py` | Add `precipitation_window_h`; clear the f000 zeros that were never measured |
 | `migrate_db.py` | Rebuild tables against the current schema |
 | `export_gfs_parquet.py` | Export `cleaned_gfs` to one Parquet file with a `unit` column |
 | `fetch_gfs_forecast.py` | Fetch a full f000–f072 GFS run, with real 3-hourly precipitation |
@@ -714,9 +728,11 @@ database from `schema.sql`, so any table must be declared there to be covered.
   backfilled. Raise `misfire_grace_time` on a job if you need catch-up behaviour.
 - **`is_synthetic` is row-level, not column-level**, so it cannot express a partial
   fallback where some fields are real and others synthetic.
-- **The scheduled GFS job carries no usable precipitation.** It asks for forecast
-  hour 000, where APCP does not exist, so `cleaned_gfs.precipitation_clean` is a
-  constant `0.0`. See [Why precipitation is all zeros](#why-precipitation-is-all-zeros).
+- **The scheduled GFS job carries no precipitation.** It asks for forecast hour 000,
+  where APCP does not exist. That used to be stored as a constant `0.0`; it is now
+  `NULL` with `precipitation_window_h` `NULL` and
+  `precipitation_qc_flag = 'no_accumulation_window'`, so nothing downstream can read
+  it as a dry day. See [Why precipitation is all zeros](#why-precipitation-is-all-zeros).
   `fetch_gfs_forecast.py` gets real precipitation, but writes Parquet rather than
   into the table.
 - **`cleaned_gfs` has no forecast hours.** Every row is `fhr = 000`. The `fhr` column

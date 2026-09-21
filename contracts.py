@@ -69,6 +69,11 @@ def _build_gfs_schema():
             "fhr":              Column(str,   nullable=False),
             "temperature_raw":  Column(float, checks=Check.in_range(-60, 60),  nullable=True),
             "precipitation_raw":Column(float, checks=Check.in_range(0, 500),   nullable=True),
+            # Hours the APCP bucket covers. Null wherever precipitation is null:
+            # f000 has no accumulation interval. 3 and 6 are the values GFS uses.
+            "precipitation_window_h":
+                                Column(float, checks=Check.isin([3, 6]),      nullable=True,
+                                       required=False),
             "u_wind_raw":       Column(float, checks=Check.in_range(-150, 150),nullable=True),
             "v_wind_raw":       Column(float, checks=Check.in_range(-150, 150),nullable=True),
             "source":           Column(str,   nullable=False),

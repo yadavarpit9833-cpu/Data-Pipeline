@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS raw_gfs (
     fetched_at TEXT,
     temperature_raw REAL,
     precipitation_raw REAL,
+    -- Hours the precipitation value accumulated over. GFS APCP is a bucket, not
+    -- an instantaneous rate, and the bucket length varies with forecast hour: 3 h
+    -- at f003/f009/f015, 6 h at f006/f012/f018. NULL means there is no window and
+    -- the precipitation columns carry no measurement - which is every f000 row,
+    -- since the analysis hour has no interval to accumulate over.
+    precipitation_window_h INTEGER,
     u_wind_raw REAL,
     v_wind_raw REAL,
     raw_data BLOB,
@@ -137,6 +143,12 @@ CREATE TABLE IF NOT EXISTS cleaned_gfs (
     precipitation_clean REAL,
     precipitation_imputed INTEGER DEFAULT 0,
     precipitation_qc_flag TEXT DEFAULT 'ok',
+    -- Hours the precipitation value accumulated over. GFS APCP is a bucket, not
+    -- an instantaneous rate, and the bucket length varies with forecast hour: 3 h
+    -- at f003/f009/f015, 6 h at f006/f012/f018. NULL means there is no window and
+    -- the precipitation columns carry no measurement - which is every f000 row,
+    -- since the analysis hour has no interval to accumulate over.
+    precipitation_window_h INTEGER,
     u_wind_raw REAL,
     u_wind_clean REAL,
     u_wind_imputed INTEGER DEFAULT 0,

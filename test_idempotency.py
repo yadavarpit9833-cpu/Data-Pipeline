@@ -253,6 +253,36 @@ class TestDatabaseIdempotency(unittest.TestCase):
         self.assertNotIn("pm25_ugm3", cpcb_cols, "concentration column leaked into cleaned_cpcb")
         self.assertNotIn("pm25_raw", cams_cols, "sub-index column leaked into cleaned_cams_aq")
 
+    def test_gfs_tables_carry_the_precipitation_window(self):
+        # A GFS precipitation value is an accumulation over an interval whose length
+        # varies with forecast hour, so the number is unreadable without the window.
+        for table in ('raw_gfs', 'cleaned_gfs'):
+            self.cur.execute(f"PRAGMA table_info([{table}])")
+            cols = {r[1] for r in self.cur.fetchall()}
+            self.assertIn('precipitation_window_h', cols,
+                          f"{table} cannot say what its precipitation accumulated over")
+
+    def test_precipitation_window_accepts_a_value_and_a_null(self):
+        rows = [
+            # f003 carries a real 3-hour bucket.
+            (28.5, 77.25, "20260909_00z", "003", 1.25, 3),
+            # f000 has no interval to accumulate over: both columns null.
+            (28.5, 77.25, "20260909_00z", "000", None, None),
+        ]
+        for lat, lon, cycle, fhr, precip, window in rows:
+            self.cur.execute("""
+                INSERT OR IGNORE INTO cleaned_gfs
+                    (lat, lon, cycle, fhr, precipitation_clean, precipitation_window_h)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (lat, lon, cycle, fhr, precip, window))
+        self.conn.commit()
+
+        self.cur.execute("""SELECT fhr, precipitation_clean, precipitation_window_h
+                            FROM cleaned_gfs WHERE lat=? AND lon=? AND cycle=?
+                            ORDER BY fhr""", (28.5, 77.25, "20260909_00z"))
+        got = [tuple(r) for r in self.cur.fetchall()]
+        self.assertEqual(got, [("000", None, None), ("003", 1.25, 3)])
+
     def test_gfs_compute_valid_time(self):
         from fetch_gfs import compute_valid_time
         # Test 00Z cycle + 003 fhr

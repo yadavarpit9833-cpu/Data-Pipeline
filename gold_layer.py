@@ -219,7 +219,11 @@ def build_gfs_grid_hourly():
             temp_mean=('temperature_clean', 'mean'),
             temp_max=('temperature_clean', 'max'),
             temp_min=('temperature_clean', 'min'),
-            precip_total=('precipitation_clean', 'sum'),
+            # min_count=1 so a group with no precipitation reading sums to NaN, not
+            # 0.0. Every f000 row is now NULL - the analysis hour has no accumulation
+            # window - and a plain sum would turn that back into a measured-looking
+            # zero, which is the whole thing precipitation_window_h exists to stop.
+            precip_total=('precipitation_clean', lambda v: v.sum(min_count=1)),
             wind_speed_mean=(
                 'u_wind_clean',
                 lambda u: np.sqrt((u**2 + df.loc[u.index, 'v_wind_clean']**2)).mean()

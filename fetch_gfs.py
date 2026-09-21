@@ -68,7 +68,8 @@ def parse_grib2_subregion(content):
     """
     pos = 0
     records = {}
-    
+    windows = {}
+
     while pos < len(content) - 4:
         if content[pos:pos+4] != b'GRIB':
             # BUGFIX: without this the loop never advances on non-GRIB payloads
@@ -144,7 +145,16 @@ def parse_grib2_subregion(content):
                 else:
                     values = [round(v, 2) for v in values]
                 records[var_name] = (ni, nj, lat1, lat2, lon1, lon2, dlat, dlon, values)
-                
+                # APCP is an accumulation bucket whose length varies with forecast
+                # hour (3 h at f003, 6 h at f006 ...), so the number is meaningless
+                # without it. Product template 4.8 carries the length; 4.0 fields
+                # are instantaneous and have none.
+                if var_name == 'precipitation_raw':
+                    template = int.from_bytes(sec4[7:9], 'big')
+                    windows['precipitation_raw'] = (
+                        int.from_bytes(sec4[49:53], 'big') if template == 8 else None)
+
+    records['_windows'] = windows
     return records
 
 import hashlib
@@ -188,7 +198,16 @@ def fetch_noaa_nomads_gfs():
     ni, nj, lat1, lat2, lon1, lon2, dlat, dlon, temps = parsed['temperature_raw']
     u_winds = parsed.get('u_wind_raw', (0,0,0,0,0,0,0,0, [None]*len(temps)))[8]
     v_winds = parsed.get('v_wind_raw', (0,0,0,0,0,0,0,0, [None]*len(temps)))[8]
-    precips = parsed.get('precipitation_raw', (0,0,0,0,0,0,0,0, [0.0]*len(temps)))[8]
+    # No APCP in the payload means no accumulation to report, not zero rainfall.
+    # At f000 that is always the case: accumulation needs an interval and the
+    # analysis hour has none, so NOMADS omits the field. Filling zeros here was
+    # the original defect - it produced a measured-looking dry grid.
+    if 'precipitation_raw' in parsed:
+        precips = parsed['precipitation_raw'][8]
+        precip_window_h = parsed.get('_windows', {}).get('precipitation_raw')
+    else:
+        precips = [None] * len(temps)
+        precip_window_h = None
     
     # Generate grid coordinates
     min_lat, max_lat = min(lat1, lat2), max(lat1, lat2)
@@ -210,7 +229,8 @@ def fetch_noaa_nomads_gfs():
                 'valid_time': valid_time,
                 'fetched_at': fetched_at,
                 'temperature_raw': temps[idx] if idx < len(temps) else None,
-                'precipitation_raw': precips[idx] if idx < len(precips) else 0.0,
+                'precipitation_raw': precips[idx] if idx < len(precips) else None,
+                'precipitation_window_h': precip_window_h,
                 'u_wind_raw': u_winds[idx] if idx < len(u_winds) else None,
                 'v_wind_raw': v_winds[idx] if idx < len(v_winds) else None,
             })
@@ -245,7 +265,9 @@ def main():
                 grid_rows.append({
                     'lat': lat, 'lon': lon, 'cycle': cycle_name, 'fhr': '000', 'valid_time': val_time,
                     'fetched_at': fetched_at_iso,
-                    'temperature_raw': 25.0, 'precipitation_raw': 0.0, 'u_wind_raw': 1.0, 'v_wind_raw': 1.0,
+                    'temperature_raw': 25.0, 'precipitation_raw': None,
+                    'precipitation_window_h': None,
+                    'u_wind_raw': 1.0, 'v_wind_raw': 1.0,
                     'is_synthetic': True
                 })
         raw_bytes = b''
@@ -262,7 +284,8 @@ def main():
     raw_hash = compute_payload_hash(raw_bytes[:1000] if raw_bytes else b'fallback_gfs')
     raw_insert_rows = [
         (r['lat'], r['lon'], r['cycle'], r['fhr'], r['valid_time'], r['fetched_at'],
-         r['temperature_raw'], r['precipitation_raw'], r['u_wind_raw'], r['v_wind_raw'], raw_bytes[:100], raw_hash,
+         r['temperature_raw'], r['precipitation_raw'], r.get('precipitation_window_h'),
+         r['u_wind_raw'], r['v_wind_raw'], raw_bytes[:100], raw_hash,
          'fallback_constant' if r.get('is_synthetic') else 'noaa',
          1 if r.get('is_synthetic') else 0)
         for r in grid_rows
@@ -271,11 +294,11 @@ def main():
     is_sqlite = os.getenv('DB_ENGINE', 'sqlite') == 'sqlite'
     # Note: We intentionally use INSERT OR IGNORE (DO NOTHING) over DO UPDATE to preserve original historical data.
     cur.executemany("""
-        INSERT OR IGNORE INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, precipitation_window_h, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """ if is_sqlite else """
-        INSERT INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+        INSERT INTO raw_gfs (lat, lon, cycle, fhr, valid_time, fetched_at, temperature_raw, precipitation_raw, precipitation_window_h, u_wind_raw, v_wind_raw, raw_data, raw_data_hash, source, is_synthetic)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
     """, raw_insert_rows)
     conn.commit()
     logger.info(f"Inserted {len(raw_insert_rows)} per-gridpoint records into raw_gfs database table.")
@@ -287,6 +310,15 @@ def main():
 
     # 2. Clean and Impute
     df = pd.DataFrame(grid_rows)
+    # A column that is entirely None lands as object dtype, and the imputer's
+    # interpolate() refuses those. Precipitation is now all-None at f000, so coerce
+    # the measurement columns to float and let NaN mean missing.
+    for _col in ('temperature_raw', 'precipitation_raw', 'u_wind_raw', 'v_wind_raw'):
+        if _col in df.columns:
+            df[_col] = pd.to_numeric(df[_col], errors='coerce')
+    df['precipitation_window_h'] = pd.to_numeric(
+        df.get('precipitation_window_h'), errors='coerce')
+
     qc_params = {
         'temperature_raw':   {'min_val': -60.0,  'max_val': 60.0,  'max_step_change': 25.0,  'ignore_zero_flatline': False},
         'precipitation_raw': {'min_val': 0.0,    'max_val': 500.0, 'max_step_change': 100.0, 'ignore_zero_flatline': True},
@@ -311,6 +343,19 @@ def main():
         rename_map[f"{metric}_qc_flag"] = f"{base}_qc_flag"
     df.rename(columns=rename_map, inplace=True)
     
+    # The imputer fills gaps, which is right for a dropout and wrong for a field
+    # that does not exist. Where there is no accumulation window there is nothing
+    # to interpolate between, so put the null back and say why in the flag.
+    no_window = df['precipitation_window_h'].isna()
+    for _c in ('precipitation_raw', 'precipitation_clean'):
+        if _c in df.columns:
+            df[_c] = pd.to_numeric(df[_c], errors='coerce')
+            df.loc[no_window, _c] = np.nan
+    df['precipitation_qc_flag'] = df['precipitation_qc_flag'].astype(object)
+    df.loc[no_window, 'precipitation_qc_flag'] = 'no_accumulation_window'
+    df['precipitation_imputed'] = df['precipitation_imputed'].astype(bool)
+    df.loc[no_window, 'precipitation_imputed'] = False
+
     if 'is_synthetic' not in df.columns:
         df['is_synthetic'] = False
         
@@ -344,6 +389,7 @@ def main():
             row.get('precipitation_clean'),
             1 if row.get('precipitation_imputed') else 0,
             row.get('precipitation_qc_flag', 'ok'),
+            row.get('precipitation_window_h'),
             row.get('u_wind_raw'),
             row.get('u_wind_clean'),
             1 if row.get('u_wind_imputed') else 0,
@@ -360,21 +406,21 @@ def main():
         INSERT OR IGNORE INTO cleaned_gfs (
             lat, lon, cycle, fhr, valid_time, fetched_at,
             temperature_raw, temperature_clean, temperature_imputed, temperature_qc_flag,
-            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag,
+            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag, precipitation_window_h,
             u_wind_raw, u_wind_clean, u_wind_imputed, u_wind_qc_flag,
             v_wind_raw, v_wind_clean, v_wind_imputed, v_wind_qc_flag,
             source, is_synthetic
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """ if is_sqlite else """
         INSERT INTO cleaned_gfs (
             lat, lon, cycle, fhr, valid_time, fetched_at,
             temperature_raw, temperature_clean, temperature_imputed, temperature_qc_flag,
-            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag,
+            precipitation_raw, precipitation_clean, precipitation_imputed, precipitation_qc_flag, precipitation_window_h,
             u_wind_raw, u_wind_clean, u_wind_imputed, u_wind_qc_flag,
             v_wind_raw, v_wind_clean, v_wind_imputed, v_wind_qc_flag,
             source, is_synthetic
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         ) ON CONFLICT DO NOTHING
     """, cleaned_insert_rows)
     conn.commit()
