@@ -434,6 +434,8 @@ python fetch_gfs_forecast.py --bbox 28.2 28.9 76.8 77.6 --out exports/gfs_ncr_fo
 `exports/gfs_ncr_forecast.parquet` is checked in: 9 NCR grid points × 25 steps = 225
 rows, same unit-suffixed column names as the extract above plus `precipitation_mm_3h`.
 It picks the newest cycle whose f072 is published, or takes `--cycle YYYYMMDDHH`.
+Re-running overwrites the file with the same 20-column schema, so a strict consumer
+can re-read it without remapping.
 
 ### Three ways these files lie to a naive reader
 
@@ -465,9 +467,19 @@ interpolate rain into it if you let it; the script puts the null back afterwards
 
 **The differencing is checked, not assumed.** The run-total record the script
 deliberately discards is used at f072 as an independent reconciliation: the 3-hourly
-increments must sum back to it at every grid point. On the committed run they agree
-to within one or two quanta of the 1/16 mm packing — the most that 24 differenced
-buckets can be expected to close to. A wider gap aborts the write.
+increments must sum back to it at every grid point, within one or two quanta of the
+1/16 mm packing — the most that 24 differenced buckets can be expected to close to.
+A wider gap aborts the write.
+
+**A dry run is confirmed at the source, not assumed either.** That reconciliation is
+vacuous when it rains nowhere: zero sums to zero whatever the decode did, and a
+silently zeroed decode is exactly what the sign-magnitude bug looked like. So when
+the whole run comes back at 0 mm, the script checks how NCEP packed the field.
+`nbits = 0` with a zero reference means the file itself reports no rain; bits present
+with every value zero means the decode ate them, and the write is refused. The
+committed 21 Sep run is genuinely dry — every APCP field is a packed constant zero,
+while the same decoder over all of India on the same cycle finds ~9,000 wet cells and
+up to 146 mm off the Bay of Bengal coast.
 
 These rows are **not** inserted into `cleaned_gfs`. Folding them in would put two
 different quantities in `precipitation_clean` — a 3-hour bucket for forecast rows, a
@@ -672,8 +684,8 @@ Parquet writes use read-merge-write with the same dedup keys, then an atomic ren
 python -m unittest test_cleaning test_idempotency
 ```
 
-33 tests: the QC chain, the gold AQI scale rules, GRIB2 scale-factor decoding and
-APCP bucket differencing (`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
+35 tests: the QC chain, the gold AQI scale rules, GRIB2 scale-factor decoding and
+APCP bucket differencing including the dry-run guard (`test_cleaning.py`), and database idempotency including GFS `valid_time` computation
 (`test_idempotency.py`). The idempotency suite builds its test
 database from `schema.sql`, so any table must be declared there to be covered.
 

@@ -198,6 +198,23 @@ class TestApcpIncrements(unittest.TestCase):
                                   3: {'values': [1.0, 2.0], 'span': 3}})
         self.assertTrue(df[df.fhr == 0]['precipitation_mm_3h'].isna().all())
 
+    def test_dry_run_is_accepted_when_the_field_was_packed_as_constant_zero(self):
+        from fetch_gfs_forecast import to_3h_increments
+        # NCEP packs nbits=0 with a zero reference when nothing fell. That is a
+        # forecast of no rain, and must not be mistaken for a broken decode.
+        buckets = {3: {'values': [0.0, 0.0], 'span': 3, 'constant_zero': True}}
+        df, notes = to_3h_increments(self._frame([3]), buckets)
+        self.assertEqual(df['precipitation_mm_3h'].tolist(), [0.0, 0.0])
+        self.assertTrue(any('constant zero' in n for n in notes))
+
+    def test_all_zero_with_packed_data_refuses_to_write(self):
+        from fetch_gfs_forecast import to_3h_increments
+        # Bits present but every decoded value zero is what the sign-magnitude bug
+        # looked like. The sum-to-run-total check cannot catch it: 0 sums to 0.
+        buckets = {3: {'values': [0.0, 0.0], 'span': 3, 'constant_zero': False}}
+        with self.assertRaises(ValueError):
+            to_3h_increments(self._frame([3]), buckets)
+
     def test_negative_increment_refuses_to_write(self):
         from fetch_gfs_forecast import to_3h_increments
         # A 6-hour bucket smaller than the 3-hour bucket inside it is impossible;

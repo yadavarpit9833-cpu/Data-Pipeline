@@ -200,6 +200,18 @@ def newest_complete_cycle(bbox):
 
 # ---------------------------------------------------------------- assembly
 
+def is_constant_zero(rec):
+    """
+    True when NCEP packed the field as a constant zero (nbits = 0, reference 0):
+    the file itself says nothing fell anywhere in this subregion. Distinguishes a
+    genuinely dry forecast from a decode that silently produced zeros - the two are
+    identical in the output, and the earlier sign-magnitude bug looked exactly like
+    a dry one.
+    """
+    s5 = rec['_s5']
+    return s5[19] == 0 and struct.unpack('>f', s5[11:15])[0] == 0.0
+
+
 def pick_apcp(records):
     """
     Of the two APCP records per file, take the one with the SHORTER accumulation
@@ -243,7 +255,8 @@ def fetch_run(cycle_date, cycle_hour, bbox):
             bucket, span = None, None          # f000 genuinely has no APCP
         else:
             bucket, span = decode(apcp), apcp['span_h']
-        buckets[fhr] = {'values': bucket, 'span': span}
+        buckets[fhr] = {'values': bucket, 'span': span,
+                        'constant_zero': apcp is not None and is_constant_zero(apcp)}
 
         # The record we deliberately do NOT use is the run total from f000. At the
         # last step it is the independent check that the differencing was right.
@@ -341,6 +354,25 @@ def to_3h_increments(df, buckets):
                      f'within {worst:.4f} mm at every grid point')
         logger.info(f"increments reconcile with the 0-{MAX_FHR}h run total "
                     f"(worst point off by {worst:.4f} mm)")
+
+    # The reconciliation above is vacuous on a dry run: 0 sums to 0 whatever the
+    # decode did. A zeroed decode and a rainless forecast are indistinguishable in
+    # the numbers, so fall back on how the field was packed. NCEP writes nbits=0
+    # with a zero reference when there is genuinely nothing; bits present but every
+    # value zero means the decode ate them, which is what the sign-magnitude bug did.
+    if float(df['precipitation_mm_3h'].fillna(0).abs().sum()) == 0.0:
+        with_bits = [f for f, b in buckets.items()
+                     if isinstance(f, int) and b['values'] is not None
+                     and not b.get('constant_zero', False)]
+        if with_bits:
+            raise ValueError(
+                f"every precipitation value is zero, but APCP carried packed data at "
+                f"f{', f'.join(f'{f:03d}' for f in with_bits)} - the decode dropped it, "
+                "refusing to write")
+        notes.append('no precipitation in the run: every APCP field was packed as a '
+                     'constant zero (nbits=0), so the file itself reports none')
+        logger.info("dry run confirmed at the source: every APCP field is a packed "
+                    "constant zero, not a decode that produced zeros")
     return df, notes
 
 
